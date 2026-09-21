@@ -21,6 +21,7 @@ const {
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const fsp = require('fs/promises');
 
 const { createStaticServer } = require('./lib/server');
 const winState = require('./lib/window-state');
@@ -407,6 +408,57 @@ function setupIpc() {
   });
 
   // 保存完之后在访达里显示（可选，页面不调也没关系）
+  // 探测常见云盘文件夹，给「自动备份到云盘」用。
+  // 只返回真实存在的路径，前端据此显示「检测到你的 Google Drive」这样的按钮。
+  ipcMain.handle('vc:cloud-folders', () => {
+    const home = app.getPath('home');
+    const out = [];
+    const add = (label, dir, kind) => {
+      try { if (fs.existsSync(dir)) out.push({ label, dir, kind }); } catch (_) {}
+    };
+    // Google Drive：新版挂在 CloudStorage 下，名字带邮箱，要扫一遍
+    try {
+      const cs = path.join(home, 'Library', 'CloudStorage');
+      if (fs.existsSync(cs)) {
+        for (const name of fs.readdirSync(cs)) {
+          const full = path.join(cs, name);
+          if (/^GoogleDrive-/i.test(name)) {
+            const my = path.join(full, 'My Drive');
+            add('Google Drive（' + name.replace(/^GoogleDrive-/i, '') + '）', fs.existsSync(my) ? my : full, 'gdrive');
+          } else if (/^OneDrive/i.test(name)) {
+            add('OneDrive', full, 'onedrive');
+          } else if (/^Dropbox/i.test(name)) {
+            add('Dropbox', full, 'dropbox');
+          }
+        }
+      }
+    } catch (_) {}
+    add('Google Drive（旧版路径）', path.join(home, 'Google Drive', 'My Drive'), 'gdrive');
+    add('iCloud 云盘', path.join(home, 'Library', 'Mobile Documents', 'com~apple~CloudDocs'), 'icloud');
+    add('Dropbox', path.join(home, 'Dropbox'), 'dropbox');
+    add('坚果云', path.join(home, 'Nutstore Files'), 'nutstore');
+    // 去重（同一个 dir 可能被加两次）
+    const seen = new Set();
+    return out.filter(x => (seen.has(x.dir) ? false : (seen.add(x.dir), true)));
+  });
+
+  // 直接把课程包写进指定文件夹（桌面版走原生 fs，不用 File System Access 的权限流程）
+  ipcMain.handle('vc:write-backup', async (e, payload) => {
+    try {
+      const dir = String((payload && payload.dir) || '');
+      const name = String((payload && payload.name) || '').replace(/[\\/]/g, '_');
+      const data = payload && payload.data;
+      if (!dir || !name || !data) return { ok: false, error: '参数不全' };
+      const target = path.join(dir, 'VoiceCollector');
+      await fsp.mkdir(target, { recursive: true });
+      const file = path.join(target, name);
+      await fsp.writeFile(file, Buffer.from(data));
+      return { ok: true, path: file, size: (await fsp.stat(file)).size };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err) };
+    }
+  });
+
   ipcMain.handle('vc:show-in-folder', (e, p) => {
     if (typeof p === 'string' && p) shell.showItemInFolder(p);
     return true;

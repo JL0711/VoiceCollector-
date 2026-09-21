@@ -8,7 +8,8 @@ const DEFAULTS = {
   liveTranslate: true, wakeLock: true,
   farMode: false, boost: 1, keepChunks: false, chunkSec: 30, asrModel: 'whisper-1',
   engine: 'auto', whisperModel: '', mtModel: '', useLocalLLM: false, llmModel: '',
-  powerSaver: false, mtEngine: 'auto', llmMtModel: '', autoPerfect: false
+  powerSaver: false, mtEngine: 'auto', llmMtModel: '', autoPerfect: false,
+  autoBackup: true, cloudDir: ''
 };
 
 let cache = null;

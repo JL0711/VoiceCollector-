@@ -170,6 +170,8 @@
       <button class="ghost" id="btnImportPack">📥 导入课程包</button>
       <input type="file" id="filePack" accept=".vcpack,application/octet-stream" multiple hidden>
       <button class="primary" id="btnReviewAll">📚 生成总复习（当前筛选的课）</button>
+      <button class="ghost" id="btnSemesterDoc">🎓 整学期讲稿合并（Word）</button>
+      <button class="ghost" id="btnSemesterPack">📦 整学期打包备份</button>
     </div>
     <div id="libList" class="lib-list"></div>
   </div>
@@ -234,6 +236,24 @@
 
     <div id="pane-sum" class="pane markdown"></div>
     <div id="pane-full" class="pane" hidden>
+      <div id="playBar" class="playbar" hidden>
+        <button class="ghost" id="pbPlay" title="播放 / 暂停（空格）">▶</button>
+        <button class="ghost" id="pbPrev" title="上一句（←）">⏮</button>
+        <button class="ghost" id="pbNext" title="下一句（→）">⏭</button>
+        <label class="pb-speed">速度
+          <select id="pbRate">
+            <option value="0.5">0.5× 很慢</option>
+            <option value="0.75">0.75× 放慢</option>
+            <option value="1" selected>1× 原速</option>
+            <option value="1.25">1.25×</option>
+            <option value="1.5">1.5×</option>
+          </select>
+        </label>
+        <label class="pb-loop"><input type="checkbox" id="pbLoop"> 单句循环 ×3</label>
+        <label class="pb-follow"><input type="checkbox" id="pbFollow" checked> 字幕跟读滚动</label>
+        <span class="pb-time" id="pbTime">0:00</span>
+      </div>
+      <div id="shadowBox" class="shadowbox" hidden></div>
       <input id="fullSearch" type="search" placeholder="在讲稿中搜索…">
       <div id="fullBody" class="transcript static"></div>
     </div>
@@ -374,6 +394,22 @@
       用 Whisper 把整节课重转一遍，它对远场和噪声的鲁棒性强得多。需要在上面配置 OpenAI 兼容的 API Key。<br>
       分段音频大约每小时多占 25–30 MB，转写完可以在下面删掉。
     </p>
+
+    <h3>云盘自动备份</h3>
+    <p class="muted">
+      课程仍然存在本机（快、能搜、离线可用），但每节课结束后会<b>自动写一份完整备份</b>
+      到你选的云盘文件夹里——讲稿、翻译、笔记、<b>原始录音</b>全在一个文件里。
+      电脑坏了或换设备，在新机器上「导入课程包」就全回来了。<br>
+      不需要注册账号、不需要 API Key，用的是你电脑上已有的 iCloud / Google Drive。
+    </p>
+    <div id="cloudFolders" class="export-row"></div>
+    <div class="export-row">
+      <button class="ghost" id="btnPickCloud">📁 自己选一个文件夹</button>
+      <button class="ghost" id="btnBackupNow">☁️ 立刻备份全部课程</button>
+      <button class="ghost" id="btnForgetCloud">✕ 取消备份</button>
+    </div>
+    <label class="check"><input type="checkbox" id="setAutoBackup"> 每节课结束后自动备份（建议开）</label>
+    <p class="muted" id="cloudStatus">还没设置备份文件夹</p>
 
     <h3>存储</h3>
     <p class="muted" id="storageInfo">—</p>

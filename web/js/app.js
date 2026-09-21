@@ -511,7 +511,12 @@ function renderSeg(seg, host, autoscroll) {
   div.dataset.id = seg.id;
   const badge = seg.zhFrom === 'mt' ? ' <i class="who" title="opus-mt 胜出">MT</i>'
     : seg.zhFrom === 'llm' ? ' <i class="who llm" title="本地大模型胜出">AI</i>' : '';
-  div.innerHTML = `<div class="t">[${mmss(seg.t)}]${seg.src === 'cloud' ? ' ☁︎' : ''}${seg.src === 'whisper-redo' ? ' ↻' : ''}${seg.kind === 'mark' ? ' ⭐ 重点' : seg.kind === 'note' ? ' 📝 笔记' : ''}${badge}</div>
+  const tools = (seg.kind === 'speech' && host.id === 'fullBody')
+    ? `<span class="row-tools"><button data-play="${seg.id}" title="播放这一句的原声">▶</button>` +
+      `<button data-loop3="${seg.id}" title="这一句连放 3 遍（跟读用）">🔂</button>` +
+      `<button data-shadow="${seg.id}" title="跟读：先听原声，再录你自己说一遍">🎤</button></span>`
+    : '';
+  div.innerHTML = `<div class="t">${tools}[${mmss(seg.t)}]${seg.src === 'cloud' ? ' ☁︎' : ''}${seg.src === 'whisper-redo' ? ' ↻' : ''}${seg.kind === 'mark' ? ' ⭐ 重点' : seg.kind === 'note' ? ' 📝 笔记' : ''}${badge}</div>
     <div class="en">${esc(seg.text)}</div>
     <div class="zh${seg.zh ? '' : ' pending'}${seg.zhAlt ? ' has-alt' : ''}"${seg.zhAlt ? ` title="${esc(seg.zhWhy || '')}\n点一下看${seg.zhAltFrom === 'llm' ? '本地大模型' : seg.zhAltFrom === 'mt' ? 'opus-mt' : '另一个模型'}的版本：${esc(seg.zhAlt)}"` : ''}>${seg.zh ? esc(seg.zh) : ''}</div>`;
   if (seg.zhAlt) {
@@ -690,6 +695,11 @@ async function stopRecording() {
   $('#inpTitle').value = '';
   toast('这节课已保存 ✓');
   go('session', cur.id);
+  // 下课自动备份到云盘（失败不打扰，设置页能看到状态）
+  if (settings().autoBackup) {
+    backupOne(cur).then(r => { if (r && r.ok && !r.skipped) toast('已备份到云盘 ☁️', 3000); })
+      .catch(e => console.warn('[VC] 自动备份失败', e));
+  }
   if (settings().autoPerfect) {
     setTimeout(() => {
       toast('开始自动精修（双模型），可以先去干别的', 6000);
@@ -766,6 +776,8 @@ async function openSession(id) {
   $('#notesOut').innerHTML = s.notesSummary ? md2html(s.notesSummary) : '';
   $('#studyBody').innerHTML = s.studyDoc ? md2html(s.studyDoc) : '<p class="muted">还没有复习文档。去「📝 我的笔记」里点「生成复习文档」，会把老师讲的和你记的合并起来，标出你漏记的和需要确认的地方。</p>';
   showPane(s.segments.length ? 'sum' : 'notes');
+
+  setupPlayer(s).catch(e => console.warn('[VC] 播放器初始化失败', e));
 
   const a = $('#player');
   if (s.hasAudio) {
@@ -1161,6 +1173,141 @@ async function testMtQuality() {
   }
 }
 
+/* ============================== 原声回放 + 跟读 ============================== */
+// 适应语速唯一有效的练习：反复听真实语速的原声，再对着它复述。
+// 读讲稿不会让耳朵变快。
+
+let PL = null, SHADOW = null;
+
+async function setupPlayer(session) {
+  const P = await mod('player');
+  const bar = $('#playBar');
+  if (!session.hasAudio) { bar.hidden = true; if (PL) { PL.destroy(); PL = null; } return; }
+
+  const rec = await db.get('audio', session.id);
+  if (!rec || !rec.blob) { bar.hidden = true; return; }
+
+  if (PL) PL.destroy();
+  PL = new P.SegmentPlayer($('#player'), {
+    onState: (st) => {
+      const m = Math.floor(st.t / 60), sec = Math.floor(st.t % 60);
+      $('#pbTime').textContent = `${m}:${String(sec).padStart(2, '0')}` + (st.dur ? ` / ${Math.floor(st.dur / 60)}:${String(Math.floor(st.dur % 60)).padStart(2, '0')}` : '');
+      $('#pbPlay').textContent = st.playing ? '⏸' : '▶';
+    }
+  });
+  PL.onActive = (segId) => highlightPlaying(segId);
+  PL.setSegments(P.withEndTimes(session.segments, session.durationMs));
+
+  bar.hidden = false;
+  $('#pbTime').textContent = '正在读取录音…';
+  const dur = await PL.load(rec.blob);
+  $('#pbTime').textContent = dur ? '0:00 / ' + Math.floor(dur / 60) + ':' + String(Math.floor(dur % 60)).padStart(2, '0')
+    : '⚠️ 这段录音无法定位（只能从头播）';
+  PL.setRate(Number($('#pbRate').value) || 1);
+  PL.setLoop($('#pbLoop').checked ? 3 : 0);
+}
+
+function highlightPlaying(segId) {
+  const host = $('#fullBody');
+  const prev = host.querySelector('.seg.playing');
+  if (prev && prev.dataset.id === segId) return;
+  if (prev) prev.classList.remove('playing');
+  if (!segId) return;
+  const el = host.querySelector(`.seg[data-id="${segId}"]`);
+  if (!el) return;
+  el.classList.add('playing');
+  if ($('#pbFollow').checked) {
+    const r = el.getBoundingClientRect();
+    if (r.top < 120 || r.bottom > window.innerHeight - 80) {
+      el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }
+}
+
+function segRange(segId) {
+  const s = S.detail; if (!s) return null;
+  const sp = s.segments.filter(x => x.kind === 'speech');
+  const i = sp.findIndex(x => x.id === segId);
+  if (i < 0) return null;
+  return { start: sp[i].t, end: i + 1 < sp.length ? sp[i + 1].t : (s.durationMs || sp[i].t + 8000), text: sp[i].text };
+}
+
+/** 跟读：先放原声，再录她说一遍，然后对比用时 */
+async function shadowPractice(segId) {
+  const r = segRange(segId); if (!r || !PL) return toast('这节课没有可回放的录音');
+  const P = await mod('player');
+  const box = $('#shadowBox');
+  box.hidden = false;
+  const origMs = r.end - r.start;
+  box.innerHTML = `<div class="sb-en">${esc(r.text)}</div><div class="sb-row"><span class="muted">先听一遍原声…</span></div>`;
+  box.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+
+  await PL.play(segId, r.start, r.end);
+  await new Promise(res => setTimeout(res, Math.min(20000, origMs / PL.rate + 500)));
+
+  if (!SHADOW) SHADOW = new P.ShadowRecorder({});
+  box.innerHTML = `<div class="sb-en">${esc(r.text)}</div>
+    <div class="sb-row"><button class="danger" id="sbStop">⏹ 我说完了</button>
+    <span class="muted" id="sbTimer">录音中… 0.0s（原声 ${(origMs/1000).toFixed(1)}s）</span></div>`;
+  SHADOW.onState = (st) => { if (st.recording) $('#sbTimer').textContent = `录音中… ${(st.ms/1000).toFixed(1)}s（原声 ${(origMs/1000).toFixed(1)}s）`; };
+  try { await SHADOW.start(); }
+  catch (e) { box.innerHTML = `<div class="muted">打不开麦克风：${esc(e.message)}</div>`; return; }
+
+  const done = await new Promise(res => {
+    $('#sbStop').onclick = async () => res(await SHADOW.stop());
+    setTimeout(async () => { if (SHADOW.recording) res(await SHADOW.stop()); }, Math.min(30000, origMs * 4 + 4000));
+  });
+  if (!done) { box.innerHTML = '<div class="muted">没录到声音，再试一次</div>'; return; }
+
+  const cmp = P.compareShadow(origMs, done.ms);
+  const url = URL.createObjectURL(done.blob);
+  box.innerHTML = `<div class="sb-en">${esc(r.text)}</div>
+    <div class="sb-verdict sb-${cmp.tone}">${esc(cmp.verdict)}</div>
+    <div class="sb-row">
+      <button class="ghost" id="sbOrig">▶ 原声 ${(origMs/1000).toFixed(1)}s</button>
+      <button class="ghost" id="sbMine">▶ 我的 ${(done.ms/1000).toFixed(1)}s</button>
+      <button class="ghost" id="sbAgain">🔁 再来一次</button>
+      <button class="ghost" id="sbClose">关闭</button>
+    </div>`;
+  const mine = new Audio(url);
+  $('#sbOrig').onclick = () => PL.play(segId, r.start, r.end);
+  $('#sbMine').onclick = () => { mine.currentTime = 0; mine.play().catch(() => {}); };
+  $('#sbAgain').onclick = () => shadowPractice(segId);
+  $('#sbClose').onclick = () => { box.hidden = true; try { URL.revokeObjectURL(url); } catch (_) {} };
+}
+
+function bindPlayerUI() {
+  on('#pbPlay', 'click', () => { if (PL) PL.toggle(); });
+  on('#pbPrev', 'click', () => { if (PL) PL.step(-1); });
+  on('#pbNext', 'click', () => { if (PL) PL.step(1); });
+  on('#pbRate', 'change', (e) => { if (PL) PL.setRate(Number(e.target.value)); });
+  on('#pbLoop', 'change', (e) => { if (PL) PL.setLoop(e.target.checked ? 3 : 0); });
+
+  // 句子上的三个按钮（事件委托，段落是动态渲染的）
+  on('#fullBody', 'click', (e) => {
+    const b = e.target.closest('[data-play],[data-loop3],[data-shadow]');
+    if (!b) return;
+    e.stopPropagation();
+    if (!PL) return toast('这节课没有保存录音');
+    const id = b.dataset.play || b.dataset.loop3 || b.dataset.shadow;
+    const r = segRange(id);
+    if (!r) return;
+    if (b.dataset.shadow) return shadowPractice(id).catch(err => toast(err.message));
+    if (b.dataset.loop3) { PL.setLoop(3); $('#pbLoop').checked = true; return PL.play(id, r.start, r.end); }
+    PL.play(id, r.start, r.end);
+  });
+
+  // 键盘：空格播放/暂停，左右切句
+  document.addEventListener('keydown', (e) => {
+    if (!PL || $('#view-session').hidden || !$('#pane-full') || $('#pane-full').hidden) return;
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+    if (e.code === 'Space') { e.preventDefault(); PL.toggle(); }
+    else if (e.code === 'ArrowLeft') { e.preventDefault(); PL.step(-1); }
+    else if (e.code === 'ArrowRight') { e.preventDefault(); PL.step(1); }
+  });
+}
+
 /* ============================== 课后精修（双模型融合） ============================== */
 // 实测（修掉批量对齐放大之后）：Qwen 1.5B 贪心解码 1.33 秒/句。
 // 这里按 3 秒/句报给用户，留足余量（偶尔有单句回退，浏览器和 node 也有差异）。
@@ -1434,6 +1581,183 @@ async function importPacks(files) {
   toast(`导入完成：成功 ${ok} 节${fail ? `，失败 ${fail} 节（文件可能损坏）` : ''}`, 6000);
 }
 
+/* ============================== 云盘备份 ============================== */
+// 本机 IndexedDB 仍是主存储；云盘文件夹是自动备份。
+// 桌面版走 Electron 原生 fs（不用走浏览器的权限流程），网页版走 File System Access API。
+
+const isDesktop = () => !!(window.VCDesktop && window.VCDesktop.isDesktop);
+
+async function cloudCtx(sess) {
+  return { teacher: nameOf(S.teachers, sess.teacherId), course: nameOf(S.courses, sess.courseId) };
+}
+
+/** 备份一节课。返回 {ok, skipped?, name?, reason?} */
+async function backupOne(sess, { force = false } = {}) {
+  const st = settings();
+  const P = await mod('pack');
+  const ctx = await cloudCtx(sess);
+  const name = P.packName(sess, ctx);
+
+  // 指纹：内容没变就不重复写（云盘同步很贵）
+  const stamp = [sess.id, sess.segments.length, sess.endedAt || 0, (sess.summary || '').length,
+                 (sess.myNotes || '').length, sess.perfectedAt || 0, sess.redoneAt || 0].join('-');
+  if (!force) {
+    try { const d = await db.get('kv', 'cloud.done.' + sess.id); if (d && d.stamp === stamp) return { ok: true, skipped: true, name }; }
+    catch (_) {}
+  }
+
+  const rec = sess.hasAudio ? await db.get('audio', sess.id) : null;
+  let chunks = [];
+  if (sess.hasChunks) { try { chunks = (await db.byIndex('chunks', 'sessionId', sess.id)).sort((a, b) => a.i - b.i); } catch (_) {} }
+  const blob = P.buildPack(sess, ctx, rec && rec.blob, chunks);
+
+  if (isDesktop() && st.cloudDir) {
+    const r = await window.VCDesktop.writeBackup(st.cloudDir, name, blob);
+    if (!r || !r.ok) return { ok: false, reason: (r && r.error) || '写入失败' };
+  } else {
+    const C = await mod('cloud');
+    const dir = await C.getFolder({ prompt: false });
+    if (!dir) return { ok: false, reason: '备份文件夹没有权限，去设置里点一下重新授权' };
+    await C.writeFile(dir, name, blob);
+  }
+  try { await db.put('kv', { k: 'cloud.done.' + sess.id, stamp, at: Date.now(), name, size: blob.size }); } catch (_) {}
+  return { ok: true, name, size: blob.size };
+}
+
+async function renderCloudFolders() {
+  const box = $('#cloudFolders');
+  if (!box) return;
+  const st = settings();
+  if (!isDesktop()) {
+    const C = await mod('cloud').catch(() => null);
+    box.innerHTML = C && C.supported()
+      ? '<span class="muted">网页版：点右边「自己选一个文件夹」，选你的 iCloud 云盘或 Google Drive 文件夹。</span>'
+      : '<span class="muted">这个浏览器不支持选文件夹，请用桌面版，或用「导出全部数据」手动备份。</span>';
+    return;
+  }
+  let list = [];
+  try { list = await window.VCDesktop.cloudFolders(); } catch (_) {}
+  if (!list.length) { box.innerHTML = '<span class="muted">没检测到云盘文件夹。装好 Google Drive 或打开 iCloud 云盘后再来，或者自己选一个。</span>'; return; }
+  box.innerHTML = list.map((f, i) =>
+    `<button class="${st.cloudDir === f.dir ? 'primary' : 'ghost'}" data-cloud="${i}">${st.cloudDir === f.dir ? '✓ ' : ''}${esc(f.label)}</button>`).join('');
+  $$('[data-cloud]', box).forEach(b => b.onclick = async () => {
+    const f = list[+b.dataset.cloud];
+    saveSettings({ cloudDir: f.dir });
+    toast('备份目标：' + f.label + '/VoiceCollector', 5000);
+    renderCloudFolders(); renderCloudStatus();
+  });
+}
+
+async function renderCloudStatus() {
+  const el = $('#cloudStatus'); if (!el) return;
+  const st = settings();
+  let where = '';
+  if (isDesktop() && st.cloudDir) where = st.cloudDir + '/VoiceCollector';
+  else { try { const C = await mod('cloud'); where = await C.folderName(); } catch (_) {} }
+  if (!where) { el.textContent = '还没设置备份文件夹'; return; }
+  let done = 0;
+  try { done = (await db.all('kv')).filter(x => String(x.k).startsWith('cloud.done.')).length; } catch (_) {}
+  el.textContent = `备份到：${where}　·　已备份 ${done} 节课`;
+}
+
+async function pickCloudFolder() {
+  if (isDesktop()) {
+    toast('桌面版请直接点上面检测到的云盘按钮；想用别的位置，把课程包手动导出到那里即可', 6000);
+    return;
+  }
+  const C = await mod('cloud');
+  try {
+    const dir = await C.pickFolder();
+    saveSettings({ cloudDir: dir.name });
+    toast('已选择：' + dir.name, 4000);
+    renderCloudStatus();
+  } catch (e) {
+    if (e && e.name === 'AbortError') return;
+    toast('选择失败：' + e.message);
+  }
+}
+
+async function backupAllNow() {
+  const st = settings();
+  if (!st.cloudDir && !isDesktop()) {
+    const C = await mod('cloud');
+    if (!(await C.getFolder({ prompt: true }))) return toast('请先选一个备份文件夹');
+  }
+  if (isDesktop() && !st.cloudDir) return toast('请先在上面选一个云盘文件夹');
+  const list = await db.sessionsSorted();
+  if (!list.length) return toast('还没有课程');
+  let ok = 0, skip = 0, fail = 0;
+  for (let i = 0; i < list.length; i++) {
+    $('#cloudStatus').textContent = `备份中 ${i + 1}/${list.length}…`;
+    try { const r = await backupOne(list[i]); if (r.skipped) skip++; else if (r.ok) ok++; else fail++; }
+    catch (_) { fail++; }
+  }
+  toast(`备份完成：新写 ${ok} 节，已是最新 ${skip} 节${fail ? `，失败 ${fail} 节` : ''}`, 6000);
+  renderCloudStatus();
+}
+
+/* ============================== 整学期归档 ============================== */
+function semesterSessions() {
+  const tf = $('#libTeacher').value, cf = $('#libCourse').value;
+  return {
+    list: S.sessions.filter(s => (!tf || s.teacherId === tf) && (!cf || s.courseId === cf)),
+    teacher: nameOf(S.teachers, tf), course: nameOf(S.courses, cf)
+  };
+}
+
+/** 把一门课整学期的讲稿合成一份 Word，复习期中期末用 */
+async function semesterDoc() {
+  const { list, teacher, course } = semesterSessions();
+  if (!list.length) return toast('当前筛选下没有课');
+  const E = await mod('export');
+  const ordered = [...list].sort((a, b) => a.startedAt - b.startedAt);
+  const title = `${course || '全部学科'}${teacher ? ' · ' + teacher : ''} 整学期讲稿`;
+  let body = `<h1>${esc(title)}</h1><p style="color:#666">共 ${ordered.length} 节课 · ${dateCN(ordered[0].startedAt)} 至 ${dateCN(ordered[ordered.length - 1].startedAt)} · VoiceCollector · 晗晗专属</p>`;
+  body += '<h2>目录</h2><ol>' + ordered.map(s => `<li>${esc(s.title)}（${dateCN(s.startedAt)}）</li>`).join('') + '</ol>';
+  for (const s of ordered) {
+    body += `<div style="page-break-before:always"></div><h1>${esc(s.title)}</h1>`;
+    body += `<p style="color:#666">${dateCN(s.startedAt)} · 时长 ${mmss(s.durationMs || 0)}</p>`;
+    if (s.summary) body += `<h2>课堂概要</h2>` + md2html(s.summary);
+    if (s.myNotes) body += `<h2>我的笔记</h2><pre style="white-space:pre-wrap;font-family:inherit">${esc(s.myNotes)}</pre>`;
+    body += `<h2>完整讲稿</h2>`;
+    for (const g of s.segments) {
+      if (g.kind !== 'speech') continue;
+      body += `<p style="margin:0 0 10px"><span style="color:#999;font-size:9pt">[${mmss(g.t)}]</span> ${esc(g.text)}`;
+      if (g.zh) body += `<br><span style="color:#0a6b3d">${esc(g.zh)}</span>`;
+      body += '</p>';
+    }
+  }
+  const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40"><head><meta charset="utf-8"><title>${esc(title)}</title><style>body{font-family:"PingFang SC","Microsoft YaHei",Calibri,sans-serif;font-size:11pt;line-height:1.65}h1{font-size:17pt}h2{font-size:14pt}</style></head><body>${body}</body></html>`;
+  download(`${title.replace(/[\\/:*?"<>|]/g, '_')}.doc`, '\ufeff' + html, 'application/msword;charset=utf-8');
+  toast(`已导出 ${ordered.length} 节课的合并讲稿`, 5000);
+}
+
+/** 整学期逐节打包备份（云盘或下载） */
+async function semesterPack() {
+  const { list, course } = semesterSessions();
+  if (!list.length) return toast('当前筛选下没有课');
+  const st = settings();
+  const toCloud = isDesktop() ? !!st.cloudDir : !!(await (await mod('cloud')).getFolder({ prompt: true }));
+  if (!toCloud && !confirm(`没有设置云盘文件夹，将逐个下载 ${list.length} 个课程包到「下载」文件夹。继续？`)) return;
+  let ok = 0;
+  for (let i = 0; i < list.length; i++) {
+    toast(`打包中 ${i + 1}/${list.length}…`, 2000);
+    try {
+      if (toCloud) { const r = await backupOne(list[i], { force: true }); if (r.ok) ok++; }
+      else {
+        const P = await mod('pack');
+        const ctx = await cloudCtx(list[i]);
+        const rec = list[i].hasAudio ? await db.get('audio', list[i].id) : null;
+        download(P.packName(list[i], ctx), P.buildPack(list[i], ctx, rec && rec.blob, []));
+        ok++;
+        await new Promise(r => setTimeout(r, 400));
+      }
+    } catch (_) {}
+  }
+  toast(`${course || '全部'}：完成 ${ok}/${list.length} 节`, 6000);
+  renderCloudStatus();
+}
+
 /* ============================== 数据管理 ============================== */
 async function openManager(store, label) {
   const list = store === 'teachers' ? S.teachers : S.courses;
@@ -1537,6 +1861,8 @@ function renderSettings() {
   $('#setLLM').checked = s.useLocalLLM;
   $('#setPower').checked = s.powerSaver;
   $('#setAutoPerfect').checked = s.autoPerfect;
+  $('#setAutoBackup').checked = s.autoBackup;
+  renderCloudFolders(); renderCloudStatus();
   $('#setMtEngine').value = s.mtEngine || 'auto';
   if (!$('#setMtModel').dataset.filled) {
     mod('mtllm-client').then(async C => {
@@ -1580,11 +1906,12 @@ function bindSettings() {
     keepChunks: $('#setKeepChunks').checked,
     powerSaver: $('#setPower').checked,
     autoPerfect: $('#setAutoPerfect').checked,
+    autoBackup: $('#setAutoBackup').checked,
     useLocalLLM: $('#setLLM').checked,
     llmModel: $('#selLLM').value || ''
   });
   ['#setProvider', '#setKey', '#setBase', '#setModel', '#setAudioBackup', '#setCloudASR',
-   '#setAGC', '#setNS', '#setLiveTrans', '#setWake', '#setFar', '#setKeepChunks', '#setLLM', '#selLLM', '#setPower', '#setAutoPerfect'].forEach(sel => {
+   '#setAGC', '#setNS', '#setLiveTrans', '#setWake', '#setFar', '#setKeepChunks', '#setLLM', '#selLLM', '#setPower', '#setAutoPerfect', '#setAutoBackup'].forEach(sel => {
     $(sel).addEventListener('change', () => { put(); renderDiag(); renderEngineUI(); });
   });
   $('#setBoost').addEventListener('input', () => {
@@ -1851,6 +2178,15 @@ async function init() {
     e.target.value = '';
   };
   $('#btnNewNote').onclick = newNotebook;
+  $('#btnSemesterDoc').onclick = () => semesterDoc().catch(e => toast(e.message));
+  $('#btnSemesterPack').onclick = () => semesterPack().catch(e => toast(e.message));
+  $('#btnPickCloud').onclick = () => pickCloudFolder().catch(e => toast(e.message));
+  $('#btnBackupNow').onclick = () => backupAllNow().catch(e => toast(e.message));
+  $('#btnForgetCloud').onclick = async () => {
+    saveSettings({ cloudDir: '' });
+    try { const C = await mod('cloud'); await C.forget(); } catch (_) {}
+    toast('已取消云盘备份'); renderCloudFolders(); renderCloudStatus();
+  };
   $('#exPack').onclick = () => exportPack().catch(e => toast('导出失败：' + e.message));
   $('#btnImportPack').onclick = () => $('#filePack').click();
   $('#filePack').onchange = async (e) => {

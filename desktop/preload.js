@@ -53,6 +53,16 @@ const VCDesktop = {
   /** 恒为 true。app.js 用它来判断「我在桌面版里」 */
   isDesktop: true,
 
+  /** 探测这台电脑上有哪些云盘文件夹（Google Drive / iCloud / OneDrive…） */
+  cloudFolders: () => ipcRenderer.invoke('vc:cloud-folders'),
+
+  /** 把课程包写进云盘文件夹（会自动建一个 VoiceCollector 子目录） */
+  writeBackup: async (dir, name, blob) => {
+    const buf = new Uint8Array(await blob.arrayBuffer());
+    return ipcRenderer.invoke('vc:write-backup', { dir, name, data: buf });
+  },
+
+
   /** 'darwin' | 'win32' | 'linux' */
   platform: PLATFORM,
 

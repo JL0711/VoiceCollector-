@@ -1,5 +1,5 @@
 // IndexedDB 封装：老师 / 学科 / 课程记录 / 录音
-const NAME = 'voicecollector', VER = 2;
+const NAME = 'voicecollector', VER = 3;
 let dbp = null;
 
 function open() {
@@ -15,6 +15,8 @@ function open() {
         s.createIndex('startedAt', 'startedAt');
       }
       if (!db.objectStoreNames.contains('audio')) db.createObjectStore('audio', { keyPath: 'sessionId' });
+      // kv：杂项键值（云盘目录句柄、备份指纹、翻译缓存…）
+      if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv', { keyPath: 'k' });
       if (!db.objectStoreNames.contains('chunks')) {
         const c = db.createObjectStore('chunks', { keyPath: 'key' });
         c.createIndex('sessionId', 'sessionId');
