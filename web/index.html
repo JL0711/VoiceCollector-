@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0b0d14">
+<title>VoiceCollector · 晗晗专属课堂助手</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="fileWarn" class="file-warn" hidden>
+  <div>
+    <h2>请不要直接双击打开 index.html</h2>
+    <p>浏览器在 <code>file://</code> 下不允许使用麦克风。请回到项目文件夹，双击 <b>启动.command</b>（Mac）或 <b>启动.bat</b>（Windows）来启动。</p>
+  </div>
+</div>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true"></span>
+    <div>
+      <h1>VoiceCollector</h1>
+      <small>晗晗专属 · 课堂实时记录与中文翻译</small>
+    </div>
+  </div>
+  <nav class="tabs">
+    <button class="tab" data-go="record">录制</button>
+    <button class="tab" data-go="library">资料库</button>
+    <button class="tab" data-go="settings">设置</button>
+  </nav>
+</header>
+
+<main>
+
+<!-- ======================= 录制 ======================= -->
+<section id="view-record" class="view">
+
+  <div id="setupCard" class="card">
+    <h2>开始一节新课</h2>
+
+    <div class="grid2">
+      <label class="field">
+        <span>老师 <em>Teacher</em></span>
+        <div class="row">
+          <select id="selTeacher"></select>
+          <button class="ghost" id="btnAddTeacher" title="新增老师">＋</button>
+        </div>
+      </label>
+
+      <label class="field">
+        <span>学科 / 课程 <em>Course</em></span>
+        <div class="row">
+          <select id="selCourse"></select>
+          <button class="ghost" id="btnAddCourse" title="新增学科">＋</button>
+        </div>
+      </label>
+    </div>
+
+    <label class="field">
+      <span>本节课标题（可留空，自动用日期）</span>
+      <input id="inpTitle" type="text" placeholder="例如：Lecture 7 — Thermodynamics">
+    </label>
+
+    <div class="grid2">
+      <label class="field">
+        <span>识别引擎 <em>Engine</em></span>
+        <select id="selEngine">
+          <option value="auto">自动 — 双引擎（推荐）</option>
+          <option value="webspeech">浏览器实时识别 — 秒出字幕，近距离用</option>
+          <option value="whisper">本地 Whisper — 离线免费，大教室/远距离用</option>
+          <option value="hybrid">双引擎 — 实时字幕 + Whisper 校正（最稳）</option>
+          <option value="cloud">云端 Whisper — 需要 API Key</option>
+        </select>
+      </label>
+      <label class="field" id="wModelField">
+        <span>Whisper 模型</span>
+        <select id="selWModel"></select>
+      </label>
+    </div>
+    <div id="engineInfo" class="tip" hidden></div>
+
+    <div class="grid3">
+      <label class="field">
+        <span>老师讲课语言</span>
+        <select id="selSrcLang"></select>
+      </label>
+      <label class="field">
+        <span>翻译成</span>
+        <select id="selDstLang">
+          <option value="zh-Hans">简体中文</option>
+          <option value="zh-Hant">繁體中文</option>
+          <option value="off">不翻译</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>麦克风（用于录音备份／音量表）</span>
+        <select id="selMic"></select>
+      </label>
+    </div>
+
+    <div class="tip">
+      ⚠️ 实时识别使用的是<b>系统默认输入设备</b>。如果你要用外接麦克风／领夹麦，请先在
+      <b>系统设置 → 声音 → 输入</b> 里把它设为默认，再回来开始录制。
+    </div>
+
+    <div class="diag" id="diag"></div>
+
+    <div class="actions">
+      <button class="primary big" id="btnStart">🎙 开始录制</button>
+      <button class="ghost" id="btnMicTest">麦克风试音（10 秒）</button>
+    </div>
+
+    <div id="testBox" class="testbox" hidden>
+      <div class="meter"><div class="meter-fill" id="testMeter"></div></div>
+      <div class="test-text" id="testText">请说话……</div>
+    </div>
+  </div>
+
+  <div id="liveCard" class="card live" hidden>
+    <div class="live-head">
+      <div>
+        <div class="pill" id="statusPill">准备中</div>
+        <h2 id="liveTitle">—</h2>
+        <small id="liveMeta">—</small>
+      </div>
+      <div class="live-right">
+        <div class="timer" id="timer">00:00:00</div>
+        <div class="meter"><div class="meter-fill" id="liveMeter"></div></div>
+        <small id="liveStats">0 段 · 0 词</small>
+      </div>
+    </div>
+
+    <div class="live-actions">
+      <button class="ghost" id="btnPause">⏸ 暂停</button>
+      <button class="ghost" id="btnMark">⭐ 标记重点</button>
+      <button class="ghost" id="btnNote">📝 插入笔记</button>
+      <button class="danger" id="btnStop">⏹ 结束并生成文档</button>
+    </div>
+
+    <div id="warnBox" class="warn" hidden></div>
+
+    <div class="transcript" id="liveTranscript"></div>
+    <div class="interim" id="interim"></div>
+  </div>
+
+  <div id="busyCard" class="card busy" hidden>
+    <div class="spinner"></div>
+    <h2 id="busyTitle">正在生成……</h2>
+    <p id="busyMsg">请稍候</p>
+  </div>
+</section>
+
+<!-- ======================= 资料库 ======================= -->
+<section id="view-library" class="view" hidden>
+  <div class="card">
+    <div class="lib-head">
+      <h2>资料库</h2>
+      <div class="row">
+        <input id="libSearch" type="search" placeholder="搜索标题 / 老师 / 内容…">
+        <select id="libTeacher"><option value="">全部老师</option></select>
+        <select id="libCourse"><option value="">全部学科</option></select>
+      </div>
+    </div>
+    <div class="export-row" style="margin-top:14px">
+      <button class="ghost" id="btnNewNote">＋ 新建笔记本（不录音）</button>
+      <button class="ghost" id="btnImportPack">📥 导入课程包</button>
+      <input type="file" id="filePack" accept=".vcpack,application/octet-stream" multiple hidden>
+      <button class="primary" id="btnReviewAll">📚 生成总复习（当前筛选的课）</button>
+    </div>
+    <div id="libList" class="lib-list"></div>
+  </div>
+</section>
+
+<!-- ======================= 总复习 ======================= -->
+<section id="view-review" class="view" hidden>
+  <div class="card">
+    <button class="ghost back" data-go="library">← 返回资料库</button>
+    <h2 id="rvTitle">总复习</h2>
+    <div class="smeta" id="rvMeta">—</div>
+    <div class="export-row">
+      <button class="ghost" id="exRvMd">⬇ Markdown</button>
+      <button class="ghost" id="exRvDoc">⬇ Word</button>
+      <button class="ghost" id="exRvPrint">🖨 打印 / 存 PDF</button>
+      <button class="primary" id="btnAiPackAll">🤖 打包给 AI 学习</button>
+    </div>
+    <div id="rvBody" class="markdown"></div>
+  </div>
+</section>
+
+<!-- ======================= 单节课详情 ======================= -->
+<section id="view-session" class="view" hidden>
+  <div class="card">
+    <button class="ghost back" data-go="library">← 返回资料库</button>
+    <h2 id="sTitle">—</h2>
+    <div class="smeta" id="sMeta">—</div>
+
+    <div class="export-row">
+      <button class="primary big" id="exFullDoc">📄 导出老师说的每一句话（Word）</button>
+      <button class="primary" id="btnAiPack">🤖 打包给 AI 学习</button>
+      <button class="primary" id="btnPerfect" title="重新识别 + 两个翻译模型各翻一遍 + 逐句取优">🏆 课后精修（双模型）</button>
+    </div>
+    <div class="export-row">
+      <button class="ghost" id="exMd">⬇ Markdown</button>
+      <button class="ghost" id="exDoc">⬇ Word（概要+讲稿）</button>
+      <button class="ghost" id="exPlain">⬇ 纯讲稿（只有老师的话）</button>
+      <button class="ghost" id="exTxt">⬇ 纯文本</button>
+      <button class="ghost" id="exSrt">⬇ 字幕 .srt</button>
+      <button class="ghost" id="exJson">⬇ 数据 .json</button>
+      <button class="ghost" id="exAudio">⬇ 录音</button>
+      <button class="ghost" id="exPack" title="含录音，拖到浏览器版或别的电脑上能完整恢复">📦 整节课打包（含录音）</button>
+      <button class="ghost" id="exPrint">🖨 打印 / 存 PDF</button>
+    </div>
+    <div class="export-row">
+      <button class="ghost" id="btnResum">↻ 重新生成概要</button>
+      <button class="ghost" id="btnRetransHQ" title="本地大模型，约 3 秒/句，比快速模型慢但译文更好">✨ 高质量重译</button>
+      <button class="ghost" id="btnRetrans">↻ 补翻译未翻译内容</button>
+      <button class="primary" id="btnRedoLocal">🖥 用录音重新识别整节课（本地，免费）</button>
+      <button class="ghost" id="btnRetranscribe">☁︎ 用云端重新转写整节课</button>
+      <button class="ghost" id="btnRename">✎ 修改信息</button>
+      <button class="danger" id="btnDelete">🗑 删除</button>
+    </div>
+
+    <div class="stabs">
+      <button class="stab active" data-pane="sum">📋 课堂概要</button>
+      <button class="stab" data-pane="full">📄 完整讲稿</button>
+      <button class="stab" data-pane="notes">📝 我的笔记</button>
+      <button class="stab" data-pane="study">📘 复习文档</button>
+      <button class="stab" data-pane="audio">🎧 录音</button>
+    </div>
+
+    <div id="pane-sum" class="pane markdown"></div>
+    <div id="pane-full" class="pane" hidden>
+      <input id="fullSearch" type="search" placeholder="在讲稿中搜索…">
+      <div id="fullBody" class="transcript static"></div>
+    </div>
+    <div id="pane-notes" class="pane" hidden>
+      <p class="muted">把你自己在课上记的笔记贴进来（手写的可以先打字/拍照转文字）。写完会自动保存。</p>
+      <textarea id="myNotes" rows="16" placeholder="例如：&#10;- 弹性 elasticity = %ΔQ / %ΔP&#10;- 老师说期中会考这个&#10;- HW4 下周五交&#10;- 没听懂：consumer surplus 那一段"></textarea>
+      <div class="export-row" style="margin-top:12px">
+        <button class="ghost" id="btnImportNotes">📂 从文件导入</button>
+        <input type="file" id="fileNotes" accept=".txt,.md,.markdown,text/plain" hidden>
+        <button class="ghost" id="btnTidyNotes">✨ 整理我的笔记</button>
+        <button class="primary" id="btnMergeNotes">📘 生成复习文档（讲稿 + 笔记合并）</button>
+      </div>
+      <div id="notesOut" class="markdown"></div>
+    </div>
+
+    <div id="pane-study" class="pane" hidden>
+      <div class="export-row">
+        <button class="ghost" id="exStudyMd">⬇ 导出 Markdown</button>
+        <button class="ghost" id="exStudyDoc">⬇ 导出 Word</button>
+        <button class="ghost" id="btnRemake">↻ 重新生成</button>
+      </div>
+      <div id="studyBody" class="markdown"></div>
+    </div>
+
+    <div id="pane-audio" class="pane" hidden>
+      <audio id="player" controls></audio>
+      <p class="muted" id="audioMsg"></p>
+    </div>
+  </div>
+</section>
+
+<!-- ======================= 设置 ======================= -->
+<section id="view-settings" class="view" hidden>
+  <div class="card">
+    <h2>设置</h2>
+
+    <h3>AI 服务（用于高质量翻译 + 课堂概要）</h3>
+    <p class="muted">不填也能用：Chrome 内置的本地翻译／摘要会顶上，再不行会用内置的离线摘要。填了 Key 质量最好。Key 只保存在你这台电脑的浏览器里，不会上传到任何第三方。</p>
+
+    <div class="grid2">
+      <label class="field"><span>服务商</span>
+        <select id="setProvider">
+          <option value="none">不使用（只用浏览器内置 / 离线）</option>
+          <option value="anthropic">Anthropic (Claude)</option>
+          <option value="openai">OpenAI 兼容接口（DeepSeek / Kimi / 智谱 / Ollama…）</option>
+        </select>
+      </label>
+      <label class="field"><span>预设</span>
+        <select id="setPreset">
+          <option value="">— 选择快速填充 —</option>
+          <option value="deepseek">DeepSeek（便宜好用）</option>
+          <option value="moonshot">Kimi / Moonshot</option>
+          <option value="zhipu">智谱 GLM</option>
+          <option value="openai">OpenAI 官方</option>
+          <option value="ollama">本地 Ollama（免费）</option>
+        </select>
+      </label>
+    </div>
+
+    <label class="field"><span>API Key</span>
+      <input id="setKey" type="password" placeholder="sk-…" autocomplete="off"></label>
+    <div class="grid2">
+      <label class="field"><span>Base URL（OpenAI 兼容时使用）</span>
+        <input id="setBase" type="text" placeholder="https://api.deepseek.com/v1"></label>
+      <label class="field"><span>模型</span>
+        <input id="setModel" type="text" placeholder="claude-opus-5"></label>
+    </div>
+
+    <h3>翻译</h3>
+    <label class="field"><span>翻译引擎</span>
+      <select id="setMtEngine">
+        <option value="auto">自动 — 上课用快模型，下课可一键高质量重翻（推荐）</option>
+        <option value="fast">只用快模型（opus-mt，秒出但质量一般）</option>
+        <option value="llm">全程用高质量模型（慢、费电，但译文好很多）</option>
+      </select></label>
+    <label class="field"><span>高质量翻译模型</span><select id="setMtModel"></select></label>
+    <div class="export-row">
+      <button class="ghost" id="btnTestMt">🧪 测一下翻译质量</button>
+    </div>
+    <div id="mtTestOut" class="markdown"></div>
+
+    <h3>课后精修</h3>
+    <label class="check"><input type="checkbox" id="setAutoPerfect"> 每节课结束后自动做精修（很慢，建议插电时再开）</label>
+    <p class="muted">
+      精修 = 用更准的 whisper-small 重新识别整段录音 → 重新翻译 →
+      把<b>新译文和上课时的旧译文逐句对比打分取优</b>（重新识别之后原文都可能不一样，
+      所以这是真的两个候选）。评分是确定性规则：数字和日期保真权重最高（作业时间错了最要命），
+      其次是术语正确性和内容覆盖度。落选的那版会保留，可以随时切换查看。
+    </p>
+
+    <h3>省电</h3>
+    <label class="check"><input type="checkbox" id="setPower"> <b>省电模式</b>（没插电、课特别长的时候开）</label>
+    <p class="muted">
+      打开后：只跑浏览器实时识别（不跑本地 Whisper）、翻译从 8 秒一批改成 20 秒一批、
+      音量表从 8fps 降到 2fps、不阻止屏幕休眠。<br>
+      代价：最终讲稿的准确率会降一些（没有 Whisper 校正），远距离尤其明显。
+      <b>大教室别开这个</b>，宁可插电。
+    </p>
+
+    <h3>识别与录音</h3>
+    <label class="check"><input type="checkbox" id="setAudioBackup"> 同时保存原始录音（强烈建议，识别出错还能重听）</label>
+    <label class="check"><input type="checkbox" id="setCloudASR"> 备用云端转写（把录音每 20 秒送去 Whisper，需要上面的 API Key，准确率更高）</label>
+    <label class="check"><input type="checkbox" id="setAGC"> 自动增益（老师离得远时打开）</label>
+    <label class="check"><input type="checkbox" id="setNS"> 降噪（教室很吵时打开，可能削弱远处人声）</label>
+    <label class="check"><input type="checkbox" id="setLiveTrans"> 边上课边翻译（关掉则下课后统一翻译，更省电）</label>
+    <label class="check"><input type="checkbox" id="setWake"> 录制时阻止屏幕休眠</label>
+
+    <h3>AI 模型（本地、免费、不用 Key）</h3>
+    <p class="muted" id="modelInfo">—</p>
+    <div class="export-row">
+      <button class="ghost" id="btnPrefetch">⬇ 预先下载模型（建议上课前在 WiFi 下做一次）</button>
+      <button class="ghost" id="btnModelClear">🧹 清除已下载的模型</button>
+    </div>
+    <div class="meter" id="dlMeterBox" hidden><div class="meter-fill" id="dlMeter"></div></div>
+
+    <h3>本地小 AI（可选）</h3>
+    <label class="check"><input type="checkbox" id="setLLM"> 用本地小模型（⚠️ 实测会编造内容，默认关闭）</label>
+    <label class="field"><span>模型</span><select id="selLLM"></select></label>
+    <p class="muted">
+      <b>实测结论（2026-09-21）：不建议开。</b> 1.5B 在浏览器里 WebGPU 会数值崩溃输出乱码、
+      CPU 又内存不足；0.5B 能跑但会<b>编造内容</b>——把「数字时代隐私观念的变化」译成
+      「这是个好问题但需要时间回答」，把「下周五午夜前」译成「明天凌晨四点」。
+      三条测试全部被择优器拦下，0 胜 3 负。同样的模型在命令行环境里是正常的，是浏览器端的后端问题。<br>
+      不需要 API Key、不联网，但<b>第一次要下载 500MB~1.2GB</b>，而且生成一份笔记要一两分钟。
+      它只负责把已经抽取出来的定义、考点、作业改写成通顺中文，<b>不允许它编造素材里没有的内容</b>，
+      写飞了会自动退回原来的抽取式笔记。<br>
+      想要真正高质量的笔记，更推荐用课程页里的「🤖 打包给 AI 学习」，把内容贴进 Claude / ChatGPT 的免费网页版。
+    </p>
+
+    <h3>远距离 / 大教室</h3>
+    <label class="check"><input type="checkbox" id="setFar"> <b>远距离模式</b>（老师离得远、阶梯教室）</label>
+    <label class="field"><span>软件增益 <b id="boostVal">1.0×</b></span>
+      <input type="range" id="setBoost" min="1" max="8" step="0.5" value="1"></label>
+    <label class="check"><input type="checkbox" id="setKeepChunks"> 保存分段音频（下课后可以用云端整段重新转写，准确率高很多）</label>
+    <p class="muted">
+      ⚠️ 说实话：浏览器的<b>实时</b>识别用的是它自己抓的音频，上面的增强<b>帮不到实时字幕</b>——离得远，实时字幕一定会变差。<br>
+      增强和分段保存作用在<b>录音</b>上。所以大教室的正确用法是：<b>开启远距离模式 + 保存分段音频，下课后点那节课里的「☁︎ 用云端重新转写整节课」</b>，
+      用 Whisper 把整节课重转一遍，它对远场和噪声的鲁棒性强得多。需要在上面配置 OpenAI 兼容的 API Key。<br>
+      分段音频大约每小时多占 25–30 MB，转写完可以在下面删掉。
+    </p>
+
+    <h3>存储</h3>
+    <p class="muted" id="storageInfo">—</p>
+    <div class="export-row">
+      <button class="ghost" id="btnBackup">⬇ 导出全部数据（备份）</button>
+      <button class="ghost" id="btnRestore">⬆ 导入备份</button>
+      <input type="file" id="fileRestore" accept="application/json" hidden>
+    </div>
+
+    <h3>管理与删除</h3>
+    <div class="export-row">
+      <button class="ghost" id="btnManageTeachers">👤 管理老师</button>
+      <button class="ghost" id="btnManageCourses">📚 管理学科</button>
+      <button class="ghost" id="btnPurgeChunks">🧹 清理所有分段音频</button>
+      <button class="ghost" id="btnPurgeAudio">🧹 清理所有录音（保留文字）</button>
+      <button class="danger" id="btnWipe">🗑 清空全部数据</button>
+    </div>
+
+    <h3>关于</h3>
+    <p class="muted">VoiceCollector · 晗晗专属 · 全部数据只存在本机浏览器里。<br>
+    建议使用 <b>Chrome</b> 或 <b>Edge</b>（最新版）。Safari 不支持实时语音识别。</p>
+  </div>
+</section>
+
+</main>
+
+<div id="toast" class="toast" hidden></div>
+
+<dialog id="aiDlg">
+  <h3>🤖 打包给 AI 学习</h3>
+  <p class="muted">这个软件里装不下 Claude（调用它必须有 API Key）。但你可以把这节课打包好，
+  粘进任何 AI 的免费网页版，让它当你的助教。下面的内容已经写好了「该怎么教你」的指令。</p>
+  <div class="grid2">
+    <label class="field"><span>贴到哪个 AI</span><select id="aiTarget"></select></label>
+    <label class="field"><span>让它做什么</span><select id="aiMode"></select></label>
+  </div>
+  <label class="check"><input type="checkbox" id="aiZh"> 同时带上中文翻译（内容会变长）</label>
+  <div id="aiParts" class="ai-parts"></div>
+  <textarea id="aiPreview" rows="8" readonly></textarea>
+  <div id="aiLinks" class="ai-links"></div>
+  <menu>
+    <button class="ghost" id="aiSave">⬇ 存成文件</button>
+    <button class="primary" id="aiClose">关闭</button>
+  </menu>
+</dialog>
+
+<dialog id="dlg">
+  <form method="dialog">
+    <h3 id="dlgTitle">标题</h3>
+    <div id="dlgBody"></div>
+    <menu>
+      <button value="cancel" class="ghost">取消</button>
+      <button value="ok" class="primary" id="dlgOk">确定</button>
+    </menu>
+  </form>
+</dialog>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

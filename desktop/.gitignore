@@ -1,0 +1,7 @@
+# 依赖和打包产物，不进 git
+node_modules/
+dist/
+# sync-web.js 生成的网页副本（源头是 ../web）
+app-web/
+# sync-web.js 生成的图标（源头是 ../web/icons/icon-512.png）
+build/icon.png

@@ -1,0 +1,16 @@
+{
+  "name": "VoiceCollector · 晗晗专属课堂助手",
+  "short_name": "VoiceCollector",
+  "description": "实时记录大学课堂、自动翻译成中文、下课自动生成课堂概要与完整讲稿",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0b0d14",
+  "theme_color": "#0b0d14",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

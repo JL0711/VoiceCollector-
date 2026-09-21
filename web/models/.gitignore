@@ -1,0 +1,36 @@
+# ───────────────────────────────────────────────────────────────
+# 离线 AI 模型目录
+#
+# 这里的 .onnx 权重动辄几十上百 MB，不该进 git 仓库。
+# 需要的时候用脚本重新拉下来就行：
+#
+#     node scripts/fetch-models.mjs --profile default
+#     # 网络不好 / 在国内：
+#     node scripts/fetch-models.mjs --profile default --mirror hf-mirror.com
+#
+# 小的配置和分词器文件（*.json / *.txt / *.spm）保留在仓库里，
+# 这样目录结构不会丢，也方便 review 模型配置有没有被改过。
+# ───────────────────────────────────────────────────────────────
+
+# 大体积权重：全部忽略
+*.onnx
+*.onnx_data
+*.onnx.data
+*.bin
+*.safetensors
+*.pt
+*.msgpack
+
+# 词表类文件也不小（opus 的 tokenizer.json 有 7 MB，whisper 的 2.4 MB），
+# 而且都是机器生成的、review 也看不出什么，一样靠脚本重新拉
+tokenizer.json
+vocab.json
+merges.txt
+*.spm
+
+# 下载中途产生的临时文件（.part 是半成品，.part.meta 是它的断点记录）
+*.part
+*.part.meta
+
+# macOS / 编辑器垃圾
+.DS_Store
