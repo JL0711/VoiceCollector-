@@ -25,7 +25,7 @@ function buildMenu(hooks) {
       title: '关于 VoiceCollector',
       message: 'VoiceCollector ' + version,
       detail: [
-        '晗晗专属 · 大学课堂实时记录与中文翻译',
+        '大学课堂实时记录与中文翻译',
         '',
         'Electron ' + process.versions.electron,
         'Chromium ' + process.versions.chrome,

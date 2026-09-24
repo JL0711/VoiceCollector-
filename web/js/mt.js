@@ -28,6 +28,7 @@
 //   → 长句必须自己切分，见下面 splitForMT()。
 
 import { pipeline, env } from '../vendor/transformers/transformers.min.js';
+import { ortWasmPaths, isBundled } from './ort-paths.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // 运行时：本地模型优先（完全离线），本地没有才去远端下载
@@ -51,10 +52,9 @@ function setupEnv() {
     if (w) {
       // whisper.js 会把 wasmPaths 设成 { wasm, mjs } 对象（带变体选择，比这里精确）。
       // 它先跑过就别覆盖 —— 覆盖成字符串会让 transformers 的 wasm 预缓存失效。
-      if (!w.wasmPaths) {
-        // 字符串前缀形式：ORT 自己按需拼 ort-wasm-simd-threaded[.jsep|.asyncify].{mjs,wasm}
-        w.wasmPaths = new URL('../vendor/transformers/ort/', import.meta.url).href;
-      }
+      // wasmPaths 在 _doLoad() 里用 ortWasmPaths() 设成 { wasm, mjs } 对象。
+      // ⚠️ 以前这里是字符串前缀 —— 开着 useWasmCache 时 transformers 只认对象形式，
+      //    字符串会被它换成 jsDelivr 的地址，翻译引擎一直在从 CDN 拉 wasm（断网就起不来）。
       if (!w.numThreads) {
         const cores = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
         const isolated = typeof globalThis.crossOriginIsolated !== 'undefined' && globalThis.crossOriginIsolated;
@@ -567,6 +567,19 @@ export class LocalMT {
     // huggingface.co 下载；ORT 的 wasm 同理会去 jsdelivr CDN。
     // 这两条都会让「断网可用」这个底线直接失效。
     setupEnv();
+    // 本地 wasm（对象形式，见 ort-paths.js）+ 模型已内置就禁止联网
+    // ⚠️ 必须**无条件**覆盖：transformers 一被 import 就会把 wasmPaths 预设成 jsDelivr 的
+    //    地址（bundle 里 `pt.versions?.web && !pt.wasm.wasmPaths` 那段，它是会执行的）。
+    //    以前这里写成「没设过才设」，结果永远看到的是它预设的 CDN 地址，直接跳过了。
+    //    ortWasmPaths() 只有本地真没有文件时才会给 CDN。
+    try {
+      const w = env.backends && env.backends.onnx && env.backends.onnx.wasm;
+      if (w) {
+        const pth = await ortWasmPaths(await hasWebGPU());
+        w.wasmPaths = { wasm: pth.wasm, mjs: pth.mjs };
+      }
+    } catch (_) {}
+    env.allowRemoteModels = !(await isBundled(this.cfg.repo));
 
     let device = this.cfg.device || 'wasm';
     let dtype = this.cfg.dtype || 'q8';

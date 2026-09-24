@@ -67,6 +67,29 @@ for (const need of ['onnx-community/whisper-base', 'onnx-community/whisper-small
 }
 if (!fail) ok('内置模型齐全');
 
+// 6. 「晗晗专属」只能藏在那个隐藏页面里（连点图标 5 下），用户平时看得到的地方一律不能有。
+//    冒烟测试只查网页界面的文字，原生菜单「关于」对话框和启动器横幅它看不见 —— 这里补上。
+{
+  const before = fail;
+  const REPO = join(WEB, '..');
+  const visible = [
+    [join(REPO, 'desktop', 'lib', 'menu.js'), '原生菜单「关于」'],
+    [join(REPO, 'server.py'), '网页版启动器横幅'],
+    [join(REPO, 'server.js'), '网页版备用启动器横幅'],
+    [join(WEB, 'manifest.webmanifest'), '应用名'],
+    [join(WEB, 'js', 'export.js'), '导出文档署名'],
+    [join(REPO, 'README.md'), 'GitHub 首页']
+  ];
+  for (const [f, where] of visible) {
+    try {
+      // 只看代码行，注释里写写没关系
+      const lines = readFileSync(f, 'utf8').split('\n').filter(l => !/^\s*(\/\/|#|\*)/.test(l));
+      if (lines.some(l => l.includes('晗晗'))) bad(`${where}（${f.split('/').slice(-2).join('/')}）里还有「晗晗」`);
+    } catch (_) {}
+  }
+  if (fail === before) ok('用户看得到的地方没有「晗晗」字样');
+}
+
 console.log('');
 if (fail) { console.error(`打包前自检失败：${fail} 个问题。修好再打包。`); process.exit(1); }
 console.log('打包前自检通过 ✓');

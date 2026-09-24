@@ -16,15 +16,10 @@
 // 常量与路径
 // ---------------------------------------------------------------------------
 
+// ORT 路径和「模型是否内置」的判断在 ort-paths.js，三个加载器共用（ORT 版本号也在那里）
+import { ortWasmPaths, isBundled } from './ort-paths.js'
 // vendor 目录相对于本文件（web/js/whisper.js -> web/vendor/transformers/）
 const LIB_URL = new URL('../vendor/transformers/transformers.min.js', import.meta.url).href
-const ORT_DIR = new URL('../vendor/transformers/ort/', import.meta.url).href
-
-// 必须和 @huggingface/transformers@4.3.0 锁定的 onnxruntime-web 版本一致，
-// 见 node_modules/@huggingface/transformers/package.json 的 dependencies。
-// 只有本地没放 .wasm 时才用得上（走 jsDelivr）。
-const ORT_VERSION = '1.31.0-dev.20260914-8d85527a0'
-const ORT_CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`
 
 const SAMPLE_RATE = 16000
 
@@ -129,56 +124,20 @@ export function ortIsLocal () {
   return _ortLocal
 }
 
-// 复刻 transformers 4.3.0 env.js 里的 isSafariBelow26()。
-// 它决定用哪个 ort wasm 变体：Safari 26 以下且没有 WebGPU 时不能用 asyncify 版本。
-function isSafariBelow26 () {
-  if (typeof navigator === 'undefined') return false
-  const ua = navigator.userAgent || ''
-  const isSafari =
-    (navigator.vendor || '').indexOf('Apple') > -1 &&
-    !ua.match(/CriOS|FxiOS|EdgiOS|OPiOS|mercury|brave/i) &&
-    !ua.includes('Chrome') &&
-    !ua.includes('Android')
-  if (!isSafari) return false
-  const m = ua.match(/Version\/(\d+)/)
-  return m ? parseInt(m[1], 10) < 26 : false
-}
-
-// 探测某个 URL 是否真的存在（HEAD 请求）。file:// 下会抛异常，当作不存在。
-async function exists (url) {
-  try {
-    const res = await fetch(url, { method: 'HEAD', cache: 'force-cache' })
-    return res.ok
-  } catch (_) {
-    return false
-  }
-}
-
 // 决定 ORT 去哪里加载 WASM 工厂(.mjs)和二进制(.wasm)。
 //
-// ⚠️ 这里**必须**显式设置，不能指望 transformers 的默认值：
-// 它在 src/backends/onnx.js 里是 `if (ONNX_ENV.versions?.web && !wasmPaths) { ...jsDelivr... }`，
-// 但 dist/transformers.min.js 这个打包产物里 `env.versions.web` 根本没被赋值
-// （在 bundle 里 grep `versions.web=` 是 0 个命中，只有两处读取）。
-// 所以那段默认逻辑是死代码，wasmPaths 会一直是 undefined，ORT 转而按自己的
-// import.meta.url 去找文件 —— 也就是 web/vendor/transformers/ 而不是它的 ort/ 子目录，
-// 必然 404。
+// ⚠️ 这里**必须**无条件显式设置：transformers 一被 import，就会在
+// `pt.versions?.web && !pt.wasm.wasmPaths` 那段里把 wasmPaths 预设成 jsDelivr 的地址。
+// （这里以前的注释说那段是「死代码」—— 错的，2026-09-24 用网络监视实测它会执行。
+//   whisper 这边一直没出事只是因为下面恰好是无条件覆盖；mt.js 写成「没设过才设」就中招了，
+//   翻译引擎一直在从 CDN 拉 wasm，断网直接起不来。）
 //
 // 顺带一提：wasmPaths 是个含 wasm + mjs 两个键的对象，正是 env.useWasmCache 预加载
 // 生效的前提（见 src/backends/utils/cacheWasm.js），所以显式设置之后
 // WASM 也会被存进 Cache Storage，第二次开课完全离线。
 //
-// 优先本地；本地没有就回退到 jsDelivr（版本号写死，和库锁定的版本对齐）。
-async function resolveOrtPaths (hasWebGPU) {
-  // 变体选择逻辑抄自 transformers 4.3.0 src/backends/onnx.js
-  const suffix = isSafariBelow26() && !hasWebGPU ? '' : '.asyncify'
-  const name = `ort-wasm-simd-threaded${suffix}`
-  const wasm = `${ORT_DIR}${name}.wasm`
-  const mjs = `${ORT_DIR}${name}.mjs`
-  const [okWasm, okMjs] = await Promise.all([exists(wasm), exists(mjs)])
-  if (okWasm && okMjs) return { wasm, mjs, local: true }
-  return { wasm: `${ORT_CDN}${name}.wasm`, mjs: `${ORT_CDN}${name}.mjs`, local: false }
-}
+// 优先本地；本地没有就回退到 jsDelivr。实现在 ort-paths.js（三个加载器共用）。
+const resolveOrtPaths = ortWasmPaths
 
 async function getRuntime () {
   if (_runtime) return _runtime
@@ -352,7 +311,16 @@ export class LocalWhisper {
 
     this._loading = (async () => {
       try {
-        const { pipeline } = await getRuntime()
+        const { pipeline, env } = await getRuntime()
+        // ⚠️ 模型已经内置在 web/models/ 里时，**禁止去网上拿任何东西**。
+        // 实测：transformers 在加载 encoder_model_fp16.onnx 之前，会先探测一次 fp32 的
+        // encoder_model.onnx（Range 请求读文件头）。我们没内置 fp32 → 本地 404 →
+        // 因为 allowRemoteModels=true，它就悄悄去 HuggingFace 拉。有网时看不出来；
+        // 网络差时这里会卡住，断网时整个识别起不来 —— 而这正是大教室里最常见的情况。
+        // 只有真没内置的模型（比如 large-v3-turbo）才允许联网下载。
+        const bundled = await isBundled(this.modelId)
+        env.allowRemoteModels = !bundled
+        this.bundled = bundled
         const gpu = await probeGPU()
 
         // 下载进度：transformers 会发 'progress_total' 事件，里面是所有文件的合计字节数，

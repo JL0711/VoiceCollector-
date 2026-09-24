@@ -300,3 +300,24 @@ h2 .opt{font-style:normal;font-size:12px;font-weight:400;color:var(--mut);margin
 .meta-miss{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 14px;margin:10px 0 4px;
   border-radius:10px;background:#f59e0b14;border:1px solid #f59e0b44;font-size:13px}
 .meta-miss[hidden]{display:none}
+
+/* 概要编辑 */
+.sum-tools{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+#sumEditor[hidden]{display:none}
+#sumText{width:100%;box-sizing:border-box;font:13.5px/1.75 ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:12px;resize:vertical}
+.sum-edit-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:12.5px}
+.sum-edit-bar .grow{flex:1}
+
+/* 所有总结 */
+.notes-bar{display:flex;gap:10px;flex-wrap:wrap;margin:6px 0 14px}
+.notes-bar input{flex:1;min-width:180px}
+.note-group{margin:18px 0 6px;font-size:13px;color:var(--mut);letter-spacing:.04em}
+.note-card{border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin:10px 0;background:var(--card)}
+.note-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;margin-bottom:6px}
+.note-head b{font-size:15px}
+.note-head .muted{font-size:12px}
+.note-head .grow{flex:1}
+.note-body{max-height:260px;overflow:auto;font-size:13.5px}
+.note-body.open{max-height:none}
+.note-empty{padding:30px 10px;text-align:center;color:var(--mut)}

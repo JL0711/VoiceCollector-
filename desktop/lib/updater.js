@@ -127,6 +127,11 @@ function getJSON(url, redirects) {
         res.resume();
         return resolve(getJSON(res.headers.location, (redirects || 0) + 1));
       }
+      if (res.statusCode === 404) {
+        // 仓库里还没发布过任何 Release —— 这不是「检查失败」，只是没有更新
+        res.resume();
+        return resolve(null);
+      }
       if (res.statusCode !== 200) {
         res.resume();
         return reject(new Error('GitHub 返回 ' + res.statusCode));
@@ -151,7 +156,7 @@ async function check({ owner, repo, currentVersion, shellVersion }) {
   const base = process.env.VC_UPDATE_API || 'https://api.github.com';
   const api = `${base}/repos/${owner}/${repo}/releases/latest`;
   const rel = await getJSON(api);
-  if (!rel || rel.draft) return { available: false, reason: '还没有正式发布的版本' };
+  if (!rel || rel.draft) return { available: false, reason: '已经是最新版（' + currentVersion + '）' };
 
   const assets = Array.isArray(rel.assets) ? rel.assets : [];
   const web = assets.find(a => /^web-.*\.zip$/i.test(a.name || ''));
@@ -270,7 +275,10 @@ async function install(info, userData, onProgress) {
     const finalDir = path.join(root, m.version);
     rmrf(finalDir);
     fs.renameSync(src, finalDir);          // 同一个卷内，rename 是原子的
-    markPending(finalDir);                 // 下次启动要是没起来，会自动丢弃
+    // ⚠️ 这里**不能**写 .pending。.pending 的意思是「这一次启动正在试用这个版本」，
+    //    只能由启动流程（main.js boot）写、由界面 init 成功后删。
+    //    装完就写的话，下次启动 activeOverlay 一看有 .pending，就会把刚装好的新版本
+    //    当成「上次没起来的坏包」删掉 —— 更新永远装不上。
     return { ok: true, version: m.version, dir: finalDir };
   } finally {
     rmrf(tmp);

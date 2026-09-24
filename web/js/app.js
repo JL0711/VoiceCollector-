@@ -81,6 +81,7 @@ function go(view, arg) {
   if (el) el.hidden = false;
   $$('.tab').forEach(b => b.classList.toggle('active', b.dataset.go === view));
   if (view === 'library') renderLibrary();
+  if (view === 'notes') renderNotes();
   if (view === 'settings') renderSettings();
   if (view === 'session') openSession(arg);
 }
@@ -120,8 +121,11 @@ const nameOf = (list, id) => (list.find(x => x.id === id) || {}).name || '';
 async function addEntity(store, label) {
   const r = await dialog('新增' + label, [{ name: 'name', label: label + '名称', placeholder: label === '老师' ? '例如：Prof. Smith' : '例如：微观经济学 ECON101' }]);
   if (!r || !r.name) return null;
-  const item = { id: uid(), name: r.name, createdAt: Date.now() };
-  await db.put(store, item);
+  // 重名就直接选中已有的，不再建一个同名的（以前她那里攒了 21 个「未命名老师」）
+  const list = store === 'teachers' ? S.teachers : S.courses;
+  const hit = list.find(x => String(x.name || '').trim().toLowerCase() === r.name.trim().toLowerCase());
+  const item = hit || { id: uid(), name: r.name.trim(), createdAt: Date.now() };
+  if (!hit) await db.put(store, item);
   await loadLists();
   const sel = store === 'teachers' ? $('#selTeacher') : $('#selCourse');
   sel.value = item.id;
@@ -950,6 +954,16 @@ async function stopRecording() {
   $('#inpTitle').value = '';
   toast('这节课已保存 ✓');
   go('session', cur.id);
+  // 下课自动存档到 App 外面（默认 iCloud 云盘，通用格式；失败不打扰，课程页能看到状态）
+  archiveOne(cur).then(r => {
+    if (!r || !r.ok) return;
+    toast('已存档到「' + (r.rel || '').split('/').pop() + '」☁️', 3500);
+    // 顺手把以前没存过的课补上（新版之前录的都没存过）。只补一次、不打扰。
+    if (!settings().archiveBackfilled) {
+      saveSettings({ archiveBackfilled: true });
+      setTimeout(() => archiveAll({ onlyMissing: true }).catch(() => {}), 5000);
+    }
+  }).catch(e => console.warn('[VC] 自动存档失败', e));
   // 下课自动备份到云盘（失败不打扰，设置页能看到状态）
   if (settings().autoBackup) {
     backupOne(cur).then(r => { if (r && r.ok && !r.skipped) toast('已备份到云盘 ☁️', 3000); })
@@ -1027,6 +1041,8 @@ async function openSession(id) {
   const miss = !s.teacherId && !s.courseId;
   $('#sMetaMiss').hidden = !miss;
   $('#pane-sum').innerHTML = md2html(s.summary || '（还没有概要，点上面的「重新生成概要」）');
+  closeSumEditor();
+  showArchiveState(s);
   const host = $('#fullBody'); host.innerHTML = '';
   s.segments.forEach(seg => renderSeg(seg, host, false));
   $('#fullSearch').value = '';
@@ -1087,6 +1103,124 @@ async function retranslate() {
 
 // 快速开始录的课下课后在这里补信息。老师/学科可以从已有的里选，也可以直接打一个新名字
 // （自动建好），空着就是不填。以前这里是下拉框，只能选已有的 —— 快速开始之后没法补新老师。
+/* ============================== 录音存档设置 ============================== */
+async function renderArchiveBox() {
+  if (!IS_DESKTOP || !window.VCDesktop.archive) return;
+  const A = await mod('archive');
+  const st = settings();
+  const def = await window.VCDesktop.archive.defaultRoot();
+  let clouds = [];
+  try { clouds = await window.VCDesktop.cloudFolders(); } catch (_) {}
+  // 选项：默认（iCloud 优先）+ 检测到的、**正在同步**的云盘。没在同步的 Google Drive 只显示不给选。
+  const opts = [{ v: '', t: '默认：' + def.replace(/^.*\/(com~apple~CloudDocs|Documents)\//, (m, k) => k === 'Documents' ? '文稿/' : 'iCloud 云盘/') }];
+  for (const c of clouds) {
+    if (c.stale) opts.push({ v: '', t: c.label, disabled: true });
+    else if (c.kind !== 'icloud') opts.push({ v: c.dir + '/VoiceCollector 存档', t: c.label + ' / VoiceCollector 存档' });
+  }
+  const sel = $('#selArchive');
+  sel.innerHTML = opts.map(o => `<option value="${esc(o.v)}"${o.disabled ? ' disabled' : ''}>${esc(o.t)}</option>`).join('');
+  sel.value = st.archiveDir || '';
+  $('#archiveWhere').textContent = await A.root(st);
+  const all = await db.all('sessions');
+  const done = all.filter(x => x.archivedAt).length;
+  const failed = all.filter(x => x.archiveError);
+  $('#archiveMsg').textContent = all.length
+    ? `已存档 ${done} / ${all.length} 节课` + (failed.length ? `　⚠️ ${failed.length} 节没存上：${failed[0].archiveError}` : '')
+    : '';
+  $('#archiveBox').hidden = false;
+}
+
+// 把还没存过档的课补存一遍（今晚之前录的都没存过）。一节一节来，不抢资源。
+async function archiveAll({ onlyMissing = true } = {}) {
+  if (S.cur) return toast('正在录课，下课再存');
+  const all = await db.all('sessions');
+  const todo = all.filter(x => !onlyMissing || !x.archivedAt);
+  let ok = 0, bad = 0;
+  for (const x of todo) {
+    if (S.cur) break;                              // 中途开始录课就停下，别抢资源
+    const r = await archiveOne(x);
+    if (r && r.ok) ok++; else bad++;
+    const m = $('#archiveMsg'); if (m) m.textContent = `正在存档 ${ok + bad} / ${todo.length}…`;
+  }
+  return { ok, bad, total: todo.length };
+}
+
+/* ============================== 概要编辑 / 所有总结 ============================== */
+// 「editor platform」：所有课的概要集中在「总结」页，哪一节都能直接改；
+// 改完自动写回数据库，并同步更新 App 外面的存档（archive.js）。
+function showArchiveState(s) {
+  const el = $('#sumArchive'); if (!el) return;
+  if (!IS_DESKTOP) { el.textContent = ''; return; }
+  el.textContent = s.archiveError ? '⚠️ 存档没成功：' + s.archiveError
+    : s.archivedAt ? '☁️ 已存档 ' + new Date(s.archivedAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    : '';
+}
+function openSumEditor() {
+  const s = S.detail; if (!s) return;
+  $('#sumText').value = s.summary || '';
+  $('#pane-sum').hidden = true; $('#sumEditor').hidden = false; $('#btnSumEdit').hidden = true;
+  $('#sumText').focus();
+}
+function closeSumEditor() {
+  if (!$('#sumEditor')) return;
+  $('#pane-sum').hidden = false; $('#sumEditor').hidden = true; $('#btnSumEdit').hidden = false;
+}
+async function saveSumEditor() {
+  const s = S.detail; if (!s) return;
+  const text = $('#sumText').value;
+  s.summary = text;
+  s.summaryEditedAt = Date.now();
+  await db.put('sessions', s);
+  $('#pane-sum').innerHTML = md2html(text || '（空）');
+  closeSumEditor();
+  toast('概要已保存');
+  archiveOne(s).then(() => showArchiveState(S.detail || s)).catch(() => {});
+}
+
+async function renderNotes() {
+  S.sessions = await db.sessionsSorted();
+  const sel = $('#notesCourse');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">全部学科</option><option value="__none">未分类</option>' +
+    S.courses.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join('');
+  sel.value = cur;
+  const q = ($('#notesQ').value || '').trim().toLowerCase();
+  const cf = sel.value;
+  const list = S.sessions.filter(s => {
+    if (cf === '__none' && s.courseId) return false;
+    if (cf && cf !== '__none' && s.courseId !== cf) return false;
+    if (q && !((s.title + ' ' + (s.summary || '')).toLowerCase().includes(q))) return false;
+    return true;
+  });
+  const host = $('#notesList');
+  if (!list.length) {
+    host.innerHTML = `<div class="note-empty">${S.sessions.length ? '没有符合条件的总结' : '还没有课。上完第一节课，概要会自动出现在这里。'}</div>`;
+    return;
+  }
+  const groups = new Map();
+  for (const s of list) {
+    const k = nameOf(S.courses, s.courseId) || '未分类';
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(s);
+  }
+  let html = '';
+  for (const [k, arr] of groups) {
+    html += `<div class="note-group">${esc(k)} · ${arr.length} 节</div>`;
+    for (const s of arr) {
+      html += `<div class="note-card" data-id="${s.id}">
+        <div class="note-head"><b>${esc(s.title)}</b>
+          <span class="muted">${[nameOf(S.teachers, s.teacherId), dateCN(s.startedAt), s.summaryEditedAt ? '改过' : ''].filter(Boolean).join(' · ')}</span>
+          <span class="grow"></span>
+          <button class="ghost" data-act="edit">✏️ 编辑</button>
+          <button class="ghost" data-act="open">打开这节课</button>
+        </div>
+        <div class="note-body markdown">${md2html(s.summary || '（这节课还没有概要）')}</div>
+      </div>`;
+    }
+  }
+  host.innerHTML = html;
+}
+
 async function renameSession() {
   const s = S.detail; if (!s) return;
   const r = await dialog('修改信息', [
@@ -1104,6 +1238,7 @@ async function renameSession() {
   await loadLists();
   openSession(s.id);
   toast('已保存');
+  archiveOne(s).catch(() => {});
 }
 
 // 按名字找老师/学科，没有就新建；空名字 = 不填
@@ -1936,6 +2071,33 @@ async function cloudCtx(sess) {
 }
 
 /** 备份一节课。返回 {ok, skipped?, name?, reason?} */
+// 录音留档（见 archive.js）：下课、改概要、改信息之后都调一次，存档永远是最新版本。
+// 失败不打扰上课 —— 记在这节课上，设置页和课程页能看到，下次再试。
+async function archiveOne(sess) {
+  let A; try { A = await mod('archive'); } catch (_) { return { ok: false }; }
+  if (!A.available()) return { ok: false };
+  const st = settings();
+  if (st.archive === false) return { ok: false, skipped: true };
+  try {
+    const P = await mod('pack');
+    const ctx = { teacher: nameOf(S.teachers, sess.teacherId), course: nameOf(S.courses, sess.courseId) };
+    const rec = sess.hasAudio ? await db.get('audio', sess.id) : null;
+    let chunks = [];
+    if (sess.hasChunks) { try { chunks = (await db.byIndex('chunks', 'sessionId', sess.id)).sort((a, b) => a.i - b.i); } catch (_) {} }
+    const pack = P.buildPack(sess, ctx, rec && rec.blob, chunks);
+    const r = await A.saveSession(sess, ctx, { st, audio: rec && rec.blob, pack });
+    const fresh = await db.get('sessions', sess.id) || sess;
+    if (r.ok) { fresh.archiveRel = r.rel; fresh.archivedAt = Date.now(); fresh.archiveError = ''; }
+    else fresh.archiveError = r.error || '存档失败';
+    await db.put('sessions', fresh);
+    if (S.detail && S.detail.id === fresh.id) Object.assign(S.detail, { archiveRel: fresh.archiveRel, archivedAt: fresh.archivedAt, archiveError: fresh.archiveError });
+    return r;
+  } catch (e) {
+    console.warn('[VC] 存档失败', e);
+    return { ok: false, error: e.message };
+  }
+}
+
 async function backupOne(sess, { force = false } = {}) {
   const st = settings();
   const P = await mod('pack');
@@ -2188,6 +2350,7 @@ async function wipeAll() {
 /* ============================== 设置 ============================== */
 function renderSettings() {
   const s = settings();
+  renderArchiveBox().catch(() => {});
   $('#setProvider').value = s.provider;
   $('#setKey').value = s.apiKey;
   $('#setBase').value = s.baseUrl;
@@ -2604,6 +2767,37 @@ async function init() {
   $('#btnRetranscribe').onclick = () => retranscribe().catch(e => toast('转写失败：' + e.message));
   $('#btnRename').onclick = renameSession;
   $('#btnFillMeta').onclick = renameSession;
+  $('#btnSumEdit').onclick = openSumEditor;
+  if (IS_DESKTOP && window.VCDesktop.archive) {
+    $('#selArchive').onchange = e => { saveSettings({ archiveDir: e.target.value }); renderArchiveBox(); };
+    $('#btnArchiveOpen2').onclick = async () => { const A = await mod('archive'); window.VCDesktop.archive.open(await A.root(settings())); };
+    $('#btnArchiveAll').onclick = async () => {
+      const r = await archiveAll({ onlyMissing: false });
+      if (r) toast(`存好了 ${r.ok} 节${r.bad ? `，${r.bad} 节没存上` : ''}`, 4000);
+      renderArchiveBox();
+    };
+  }
+  $('#btnSumCancel').onclick = closeSumEditor;
+  $('#btnSumSave').onclick = () => saveSumEditor().catch(e => toast('保存失败：' + e.message));
+  $('#notesQ').oninput = debounce(() => renderNotes(), 250);
+  $('#notesCourse').onchange = () => renderNotes();
+  $('#notesList').onclick = async e => {
+    const b = e.target.closest('button[data-act]'); if (!b) return;
+    const id = b.closest('.note-card').dataset.id;
+    go('session', id);
+    if (b.dataset.act === 'edit') {
+      // 等这节课渲染完再打开编辑器（openSession 是异步的）
+      for (let i = 0; i < 40 && !(S.detail && S.detail.id === id); i++) await new Promise(r => setTimeout(r, 50));
+      openSumEditor();
+    }
+  };
+  if (IS_DESKTOP && window.VCDesktop.archive) {
+    $('#btnArchiveOpen').hidden = false;
+    $('#btnArchiveOpen').onclick = async () => {
+      const A = await mod('archive');
+      window.VCDesktop.archive.open(await A.root(settings()));
+    };
+  }
   $('#btnDelete').onclick = deleteSession;
   } catch (e) {
     // 有元素没找到之类的问题，只报警不中断 —— 否则后面所有按钮都绑不上

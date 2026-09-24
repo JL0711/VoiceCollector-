@@ -1,7 +1,7 @@
 {
   "name": "voicecollector-desktop",
   "productName": "VoiceCollector",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "VoiceCollector 桌面版 · 大学课堂实时记录、中文翻译与课堂笔记生成",
   "author": {
     "name": "VoiceCollector",
@@ -15,12 +15,13 @@
     "dev": "electron . --dev",
     "smoke": "electron . --smoke-test",
     "sync": "node scripts/sync-web.js",
-    "dist": "npm run preflight && npm run sync && electron-builder && npm run smoke:packed",
-    "dist:mac": "npm run preflight && npm run sync && electron-builder --mac && npm run smoke:packed",
+    "dist": "npm run preflight && npm run sync && electron-builder && npm run smoke:packed && npm run clean:staging",
+    "dist:mac": "npm run preflight && npm run sync && electron-builder --mac && npm run smoke:packed && npm run clean:staging",
     "dist:win": "npm run preflight && npm run sync && electron-builder --win",
     "dist:dir": "npm run preflight && npm run sync && electron-builder --dir && npm run smoke:packed",
     "preflight": "node scripts/preflight.mjs",
-    "smoke:packed": "node scripts/smoke-packed.mjs"
+    "smoke:packed": "node scripts/smoke-packed.mjs",
+    "clean:staging": "node scripts/clean-staging.mjs"
   },
   "devDependencies": {
     "electron": "^44.4.3",

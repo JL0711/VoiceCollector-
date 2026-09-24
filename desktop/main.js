@@ -16,14 +16,14 @@
 'use strict';
 
 const {
-  app, BrowserWindow, session, ipcMain, dialog, shell,
+  app, BrowserWindow, session, ipcMain, dialog, shell, net,
   powerSaveBlocker, systemPreferences, screen
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsp = require('fs/promises');
 
-const { createStaticServer } = require('./lib/server');
+const { createStaticServer, resolveSafe, MIME } = require('./lib/server');
 const updater = require('./lib/updater');
 const winState = require('./lib/window-state');
 const { buildMenu } = require('./lib/menu');
@@ -180,7 +180,9 @@ function clampToVisibleDisplay(st) {
   return Object.assign({}, st, { x: undefined, y: undefined });
 }
 
+let mainWindowCreated = false;
 function createWindow(indexUrl) {
+  mainWindowCreated = true;
   const stateFile = path.join(app.getPath('userData'), 'window-state.json');
   const st = clampToVisibleDisplay(winState.readState(stateFile));
 
@@ -420,7 +422,7 @@ function setupIpc() {
       lastUpdateInfo = r.available ? r : null;
       return r;
     } catch (e) {
-      return { available: false, error: true, reason: '检查失败：' + e.message };
+      return { available: false, error: true, reason: '现在连不上更新服务器，不影响使用，有网的时候再点一次（' + e.message + '）' };
     }
   });
 
@@ -520,8 +522,12 @@ function setupIpc() {
         for (const name of fs.readdirSync(cs)) {
           const full = path.join(cs, name);
           if (/^GoogleDrive-/i.test(name)) {
+            // 没有「My Drive」= Google Drive 桌面版没在同步这个账号（没登录或已退出）。
+            // 写进去的文件不会上传，所以不能当成可用的云盘给她选。
             const my = path.join(full, 'My Drive');
-            add('Google Drive（' + name.replace(/^GoogleDrive-/i, '') + '）', fs.existsSync(my) ? my : full, 'gdrive');
+            const acct = name.replace(/^GoogleDrive-/i, '');
+            if (fs.existsSync(my)) add('Google Drive（' + acct + '）', my, 'gdrive');
+            else out.push({ label: 'Google Drive（' + acct + '）— 未在同步，请先打开 Google Drive 登录', dir: '', kind: 'gdrive', stale: true });
           } else if (/^OneDrive/i.test(name)) {
             add('OneDrive', full, 'onedrive');
           } else if (/^Dropbox/i.test(name)) {
@@ -536,7 +542,7 @@ function setupIpc() {
     add('坚果云', path.join(home, 'Nutstore Files'), 'nutstore');
     // 去重（同一个 dir 可能被加两次）
     const seen = new Set();
-    return out.filter(x => (seen.has(x.dir) ? false : (seen.add(x.dir), true)));
+    return out.filter(x => (!x.dir || seen.has(x.dir) ? !x.dir : (seen.add(x.dir), true)));
   });
 
   // 直接把课程包写进指定文件夹（桌面版走原生 fs，不用 File System Access 的权限流程）
@@ -554,6 +560,49 @@ function setupIpc() {
     } catch (err) {
       return { ok: false, error: String((err && err.message) || err) };
     }
+  });
+
+  // ── 录音留档：每节课一个文件夹，通用格式，放在 App 外面 ──
+  // 为什么要这个：以前「自动备份」开着但备份位置从来是空的，一次都没备份过 ——
+  // 所有录音只存在 App 自己的数据库里，App 数据一坏就全没了。
+  // 存档用的全是通用格式（录音文件 / Markdown / 课程包），以后就算不用这个 App 也打得开。
+  const defaultArchiveRoot = () => {
+    const home = app.getPath('home');
+    const icloud = path.join(home, 'Library', 'Mobile Documents', 'com~apple~CloudDocs');
+    // iCloud 云盘优先：macOS 自带、自动同步到云端、换电脑/手机也在
+    if (process.env.VC_ARCHIVE_ROOT) return process.env.VC_ARCHIVE_ROOT;
+    // ⚠️ 冒烟测试 / 演练绝不能写进她的 iCloud —— 一晚上跑几十次就是几十个测试文件夹
+    if (SMOKE) return path.join(app.getPath('userData'), 'archive-test');
+    if (fs.existsSync(icloud)) return path.join(icloud, 'VoiceCollector 存档');
+    return path.join(app.getPath('documents'), 'VoiceCollector 存档');
+  };
+  ipcMain.handle('vc:archive-default', () => defaultArchiveRoot());
+
+  ipcMain.handle('vc:archive-write', async (e, payload) => {
+    try {
+      const root = String((payload && payload.root) || defaultArchiveRoot());
+      const rel = String((payload && payload.rel) || '');
+      const data = payload && payload.data;
+      if (!rel || data == null) return { ok: false, error: '参数不全' };
+      // 只允许写在存档根目录里面，防止 ../ 之类跑出去
+      const target = path.resolve(root, rel);
+      if (!target.startsWith(path.resolve(root) + path.sep)) return { ok: false, error: '非法路径' };
+      await fsp.mkdir(path.dirname(target), { recursive: true });
+      const buf = typeof data === 'string' ? Buffer.from(data, 'utf8') : Buffer.from(data);
+      // 先写临时文件再改名：写到一半断电/同步中途，不会留下一个坏文件
+      const tmp = target + '.part';
+      await fsp.writeFile(tmp, buf);
+      await fsp.rename(tmp, target);
+      return { ok: true, path: target, size: buf.length };
+    } catch (err) {
+      return { ok: false, error: String((err && err.message) || err), code: err && err.code };
+    }
+  });
+
+  ipcMain.handle('vc:archive-open', async (e, dir) => {
+    const d = String(dir || defaultArchiveRoot());
+    try { await fsp.mkdir(d, { recursive: true }); } catch (_) {}
+    return shell.openPath(d);
   });
 
   ipcMain.handle('vc:show-in-folder', (e, p) => {
@@ -620,7 +669,17 @@ function filtersFor(name, mime) {
 // ───────────────────────── 冒烟测试 ─────────────────────────
 // 无头/CI 环境下用：`npx electron . --smoke-test`
 function runSmokeTest(win, web) {
+  // 总看门狗：不管卡在哪一步，120 秒还没出结果就判失败。
+  // 「网络卡死」这类问题的表现恰恰就是永远不结束，没有这个的话测试会一直挂着。
+  const watchdog = setTimeout(() => {
+    console.log('===VC_SMOKE_BEGIN===');
+    console.log(JSON.stringify({ ok: false, error: '120 秒没跑完 —— 卡死了', hung: true,
+      net: { mode: process.env.VC_NET || 'normal', external: externalRequests.slice() } }, null, 2));
+    console.log('===VC_SMOKE_END===');
+    app.exit(1);
+  }, 120000);
   const out = res => {
+    clearTimeout(watchdog);
     console.log('===VC_SMOKE_BEGIN===');
     console.log(JSON.stringify(res, null, 2));
     console.log('===VC_SMOKE_END===');
@@ -701,6 +760,9 @@ function runSmokeTest(win, web) {
         const rec = await win.webContents.executeJavaScript(`(async () => {
           const r = { ok:false, error:'', addedTeacher:false, addedCourse:false,
                       started:false, stopped:false, engine:'', segs:0, sessionId:'' };
+          // window.VC 是 init() 最后才赋值的。init 里现在要先等旧数据迁移，
+          // 所以不能「页面加载完 3 秒」就认定它该有了 —— 等最多 60 秒。
+          for (let i = 0; i < 300 && !(window.VC && window.VC._test); i++) await new Promise(res => setTimeout(res, 200));
           const VC = window.VC;
           if (!VC || !VC._test || !VC._test.startRecording) {
             r.error = 'window.VC._test 不存在 —— init() 很可能已经抛异常了';
@@ -730,6 +792,14 @@ function runSmokeTest(win, web) {
               throw new Error(btnSel + ' 新增后 ' + selSel + ' 没有选中新条目');
             return true;
           };
+          // 更新：当前用的是哪个版本（演练「更新」「坏更新自动退回」要看这个）
+          try { r.updState = await window.VCDesktop.update.state(); } catch (e) { r.updState = { error: e.message }; }
+          if (${JSON.stringify(process.env.VC_SMOKE_UPDATE || '')} === 'install') {
+            try {
+              r.updCheck = await window.VCDesktop.update.check();
+              r.updInstall = r.updCheck && r.updCheck.available ? await window.VCDesktop.update.install() : null;
+            } catch (e) { r.updInstall = { ok: false, reason: e.message }; }
+          }
           // 数据库里现在有什么（迁移之后用来核对）
           try {
             r.counts = {
@@ -743,7 +813,8 @@ function runSmokeTest(win, web) {
           try {
             const FLOW = ${JSON.stringify(process.env.VC_SMOKE_FLOW || 'full')};
             r.flow = FLOW;
-            if (q('#selDstLang')) q('#selDstLang').value = 'off';   // 冒烟测试里不跑翻译
+            const WITH_ZH = ${JSON.stringify(process.env.VC_SMOKE_TRANSLATE === '1')};
+            if (q('#selDstLang')) q('#selDstLang').value = WITH_ZH ? 'zh-Hans' : 'off';
             if (FLOW === 'quick') {
               // ⚡ 立即开始：什么都不填，一键开录
               r.addedTeacher = r.addedCourse = true;   // 这个流程不需要
@@ -781,8 +852,14 @@ function runSmokeTest(win, web) {
 
             // 顺手把落段这条链路走通：Electron 里没有 Web Speech，
             // 不直接喂它的话这段代码在桌面版永远测不到。
-            VC._test.addSegment({ text: 'This is a smoke test sentence.', kind: 'speech', t: 0 });
+            VC._test.addSegment({ text: 'The Supreme Court decided this case in nineteen sixty four.', kind: 'speech', t: 0 });
             await sleep(200);
+            if (WITH_ZH) {
+              // 实时翻译要在 40 秒内出中文（本地 opus-mt，第一次要加载模型）
+              await until(() => (VC.S.cur && VC.S.cur.segments || []).some(x => x.zh && /[\u4e00-\u9fff]/.test(x.zh)), 40000);
+              const sg = (VC.S.cur && VC.S.cur.segments || []).find(x => x.kind === 'speech');
+              r.zh = sg ? (sg.zh || '') : '';
+            }
             r.waitingCleared = !q('#liveTranscript .waiting');   // 出字之后提示要撤掉
             await until(() => (VC.S.cur.segments || []).length > 0, 4000);
             r.segs = (VC.S.cur.segments || []).length;
@@ -826,8 +903,54 @@ function runSmokeTest(win, web) {
             // 只要它别抛异常就行（FRAG.flush() 就在它开头）。
             await Promise.race([ VC._test.stopRecording(), sleep(15000) ]);
             r.stopped = !(VC.S && VC.S.cur);
+            // 下课自动存档（写到临时目录，见 defaultArchiveRoot）
+            if (r.stopped) {
+              await until(() => VC.S.detail && VC.S.detail.id === r.sessionId && (VC.S.detail.archivedAt || VC.S.detail.archiveError), 20000);
+              const sx = await VC.db.get('sessions', r.sessionId);
+              r.archived = !!(sx && sx.archivedAt);
+              r.archiveRel = (sx && sx.archiveRel) || '';
+              r.archiveError = (sx && sx.archiveError) || '';
+            }
+            // 概要编辑器：改一句，保存，数据库和存档都要跟着变
+            if (r.stopped && FLOW !== 'quick') {
+              await until(() => VC.S.detail && VC.S.detail.id === r.sessionId, 8000);
+              q('#btnSumEdit').click();
+              await until(() => !q('#sumEditor').hidden, 3000);
+              q('#sumText').value = ['# 我改过的概要', '', '- 冒烟测试编辑器'].join(String.fromCharCode(10));
+              const before = (await VC.db.get('sessions', r.sessionId)).archivedAt || 0;
+              q('#btnSumSave').click();
+              await until(() => q('#sumEditor').hidden, 3000);
+              const sy = await VC.db.get('sessions', r.sessionId);
+              r.editedSaved = !!(sy && /冒烟测试编辑器/.test(sy.summary || ''));
+              // 等存档重写一次
+              for (let i = 0; i < 60; i++) {
+                const sz = await VC.db.get('sessions', r.sessionId);
+                if (sz && sz.archivedAt && sz.archivedAt > before) { r.editedArchived = true; break; }
+                await sleep(150);
+              }
+              // 「总结」页要能看到它
+              document.querySelector('[data-go="notes"]').click();
+              await until(() => q('#notesList .note-card'), 5000);
+              r.notesShows = Array.from(document.querySelectorAll('#notesList .note-card')).some(c => /冒烟测试编辑器/.test(c.textContent));
+              // 设置页：存档区要显示出来、位置对、「全部补存」能跑完
+              document.querySelector('[data-go="settings"]').click();
+              await until(() => q('#archiveBox') && !q('#archiveBox').hidden, 5000);
+              r.archiveBoxWhere = (q('#archiveWhere') && q('#archiveWhere').textContent) || '';
+              q('#btnArchiveAll').click();
+              const DONE_RE = new RegExp('已存档 ([0-9]+) / ([0-9]+) 节');
+              // 设置页一打开就会显示「已存档 1 / N」，所以不能一匹配就算完；
+              // 「正在存档…」又可能一闪而过抓不到。等补存结束时的 toast「存好了 N 节」（停留 4 秒）。
+              await until(() => toastText().includes('存好了'), 30000);
+              await until(() => DONE_RE.test((q('#archiveMsg') || {}).textContent || ''), 5000);
+              r.archiveMsg = (q('#archiveMsg') || {}).textContent || '';
+              const dm = DONE_RE.exec(r.archiveMsg);
+              r.archiveAllOk = !!dm && dm[1] === dm[2];
+            }
             if (FLOW === 'quick' && r.stopped) {
-              await until(() => q('#view-session') && !q('#view-session').hidden, 8000);
+              // 注意：go('session') 是同步切页，openSession 才异步读库、设提示条。
+              // 只等「页面可见」会抢跑 —— 要等到这节课真的渲染完（S.detail 就是它）。
+              await until(() => VC.S.detail && VC.S.detail.id === r.sessionId
+                                && q('#sMetaMiss') && !q('#sMetaMiss').hidden, 10000);
               r.metaMissShown = !!(q('#sMetaMiss') && !q('#sMetaMiss').hidden);
               // 下课补填：直接打一个**新**老师名字 + 一个新学科
               q('#btnFillMeta').click();
@@ -851,7 +974,9 @@ function runSmokeTest(win, web) {
                  && r.brandLeak === false && r.dedication === true
                  && r.waitingShown === true && r.waitingCleared === true
                  && (r.diagRed || []).length === 0 && r.sleepBlocked === true
-                 && r.summaryOk === true
+                 && r.summaryOk === true && r.archived === true
+                 && (r.flow === 'quick' || (r.editedSaved && r.editedArchived && r.notesShows && /archive-test/.test(r.archiveBoxWhere) && r.archiveAllOk))
+                 && (!${JSON.stringify(process.env.VC_SMOKE_TRANSLATE === '1')} || /[\u4e00-\u9fff]/.test(r.zh || ''))
                  && (r.flow !== 'quick' || (r.quickNoMeta && r.engine === 'whisper'
                       && /whisper-base/.test(r.wmodel) && r.metaMissShown && r.filled && r.metaMissHiddenAfter));
           return r;
@@ -870,7 +995,7 @@ function runSmokeTest(win, web) {
           webRoot: web.dir,
           serverOrigin: httpServer ? httpServer.origin : '',
           recording: rec,
-          net: { mode: process.env.VC_NET || 'normal', external: externalRequests.slice() },
+          net: { mode: process.env.VC_NET || 'normal', external: externalRequests.slice(), local: localModelRequests.slice() },
           probe: probe
         });
       } catch (err) {
@@ -887,9 +1012,17 @@ function runSmokeTest(win, web) {
 //   VC_NET=blackhole 对外请求一律挂起、永不返回（最糟的「网络差」：连得上但不回）
 // 不设就是正常联网，只做记录。本机 127.0.0.1 的请求永远放行。
 const externalRequests = [];
+const localModelRequests = [];
 function setupNetworkWatch(ses) {
   const mode = process.env.VC_NET || '';
   if (!SMOKE && !mode) return;
+  const note = (d, what) => {
+    if (/\/(models|vendor)\//.test(d.url || '') && localModelRequests.length < 120) {
+      localModelRequests.push((d.method || 'GET') + ' ' + what + ' ' + String(d.url).replace(/^https?:\/\/[^/]+/, '').slice(0, 110));
+    }
+  };
+  ses.webRequest.onCompleted(d => note(d, String(d.statusCode) + (d.fromCache ? '(缓存)' : '')));
+  ses.webRequest.onErrorOccurred(d => note(d, 'ERR ' + d.error));
   ses.webRequest.onBeforeRequest((details, cb) => {
     const u = details.url || '';
     if (/^(https?|wss?):\/\/(127\.0\.0\.1|localhost)(:|\/)/i.test(u) || !/^(https?|wss?):/i.test(u)) return cb({});
@@ -911,6 +1044,7 @@ function setupNetworkWatch(ses) {
 // 被别的程序占了才往后顺延，选中的那个同样记下来。万一真的换了端口，
 // 旧端口里的数据会在下次启动时被 migrateOrigins() 搬过来（见下面），不会再丢。
 const PREFERRED_PORT = 47823;
+let busySavedPort = 0;   // 这次启动时，原来的端口被别的程序占着（它下面的数据得换个办法读）
 const PORT_FILE = () => path.join(app.getPath('userData'), 'port.json');
 
 function readSavedPort() {
@@ -934,7 +1068,10 @@ async function listenStable(root, opt) {
     try {
       const srv = await createStaticServer(root, Object.assign({}, opt, { port }));
       if (port !== saved) {
-        if (saved) console.log('[端口] 原来的 ' + saved + ' 被占用了，改用 ' + port + '（旧数据会自动搬过来）');
+        if (saved) {
+          console.log('[端口] 原来的 ' + saved + ' 被占用了，改用 ' + port + '（旧数据会自动搬过来）');
+          busySavedPort = saved;
+        }
         savePort(port);
       }
       return srv;
@@ -1016,11 +1153,51 @@ async function exportOrigin(root, port) {
   }
 }
 
+// 旧端口正被别的程序占着 → 没法在那个端口起临时服务器 → 但数据库是按「网址」存的，
+// 只要浏览器以为自己在那个网址下就能读。所以：在 App 内部拦截对那个网址的 http 请求，
+// 直接从磁盘把 migrate.html 等文件给它，根本不碰那个端口。
+// ⚠️ 拦截对整个 session 生效，所以只在「主窗口打开之前」做、做完立刻撤掉，
+//    正常情况（端口没被占）永远不会走到这里。
+async function exportOriginIntercept(root, port) {
+  const origin = 'http://127.0.0.1:' + port;
+  const ses = session.defaultSession;
+  try { await ses.clearStorageData({ origin, storages: ['serviceworkers', 'cachestorage'] }); } catch (_) {}
+  ses.protocol.handle('http', async req => {
+    if (req.url.startsWith(origin + '/')) {
+      const file = resolveSafe(root, new URL(req.url).pathname);
+      try {
+        const buf = await fsp.readFile(file);
+        return new Response(buf, { headers: { 'Content-Type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream' } });
+      } catch (_) { return new Response('', { status: 404 }); }
+    }
+    return net.fetch(req, { bypassCustomProtocolHandlers: true });
+  });
+  let win = null;
+  try {
+    win = new BrowserWindow({ show: false, webPreferences: { contextIsolation: true, sandbox: true } });
+    await withTimeout(win.loadURL(origin + '/migrate.html'), 8000, '加载');
+    for (let i = 0; i < 50; i++) {
+      if (await win.webContents.executeJavaScript('!!window.__vcReady', true)) break;
+      await new Promise(r => setTimeout(r, 100));
+    }
+    const dump = await withTimeout(win.webContents.executeJavaScript('window.__vcExport()', true), 20000, '读取');
+    return { port, dump };
+  } catch (e) {
+    return { port, skipped: true, reason: e.message };
+  } finally {
+    try { win && !win.isDestroyed() && win.destroy(); } catch (_) {}
+    try { ses.protocol.unhandle('http'); } catch (_) {}
+  }
+}
+
+let preDumps = [];   // 主窗口打开前就读好的（被占端口那一份）
+
 async function migrateOrigins(root, currentPort) {
-  const ports = oldPorts(currentPort);
-  if (!ports.length) return;
+  const pre = new Set(preDumps.map(d => d.port));
+  const ports = oldPorts(currentPort).filter(p => !pre.has(p));
+  if (!ports.length && !preDumps.length) return;
   console.log('[迁移] 发现 ' + ports.length + ' 个旧端口的数据库：' + ports.join(', '));
-  const dumps = [];
+  const dumps = preDumps.filter(r => r.dump).map(r => r.dump);
   const empty = [];
   for (const p of ports) {
     const r = await exportOrigin(root, p);
@@ -1066,7 +1243,7 @@ async function boot() {
   const bundled = updater.readManifest(web.dir);
   const bundledVer = (bundled && bundled.version) || '0.0.0';
   try {
-    overlayInfo = SMOKE ? null : updater.activeOverlay(app.getPath('userData'), bundledVer);
+    overlayInfo = (SMOKE && process.env.VC_TEST_UPDATE !== '1') ? null : updater.activeOverlay(app.getPath('userData'), bundledVer);
   } catch (e) { console.log('[更新] 检查更新层出错：' + e.message); overlayInfo = null; }
   if (overlayInfo) {
     console.log('[更新] 使用更新层 ' + overlayInfo.version + '（内置 ' + bundledVer + '）');
@@ -1079,6 +1256,15 @@ async function boot() {
     overlay: overlayInfo ? overlayInfo.dir : null
   });
   console.log('[本地服务] ' + httpServer.indexUrl);
+  // 原来的端口被别的程序占着：它下面的数据只能靠拦截来读，而拦截必须在主窗口打开前做完。
+  // 只有这种少见情况会让窗口晚一两秒出来。
+  if (busySavedPort && (!SMOKE || process.env.VC_TEST_MIGRATE === '1')) {
+    try {
+      const r = await withTimeout(exportOriginIntercept(web.dir, busySavedPort), 30000, '读取被占端口');
+      if (r && r.dump) { preDumps = [r]; console.log('[迁移] 端口 ' + busySavedPort + ' 被占着，已用拦截的办法读出旧数据'); }
+      else console.log('[迁移] 端口 ' + busySavedPort + ' 被占着，这次没读出来：' + (r && r.reason));
+    } catch (e) { console.log('[迁移] 读取被占端口失败：' + e.message); }
+  }
   // 迁移放后台跑，**绝不能挡住开窗口**：万一哪个旧库卡住，App 至少要能打开能录课。
   if (!SMOKE || process.env.VC_TEST_MIGRATE === '1') {
     migrationPromise = migrateOrigins(web.dir, httpServer.port)
@@ -1120,6 +1306,10 @@ if (gotLock) {
 }
 
 app.on('window-all-closed', () => {
+  // ⚠️ 主窗口还没建出来的时候不算。启动时读旧数据会开一个隐藏窗口、读完关掉，
+  //    那一刻「所有窗口都关了」—— 不拦的话 App 会在启动途中把自己关掉
+  //    （will-quit 把 httpServer 置空，接着 boot 里就是 null.port 崩溃）。
+  if (!mainWindowCreated) return;
   // 所有平台都退出：留个后台进程在 Dock 里空耗电没意义（需求 3：能省电就省电）
   app.quit();
 });

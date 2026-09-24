@@ -31,6 +31,7 @@
     <button class="upd-pill" id="btnUpdPill" hidden>🆕 有新版本</button>
     <button class="tab" data-go="record">录制</button>
     <button class="tab" data-go="library">资料库</button>
+    <button class="tab" data-go="notes">总结</button>
     <button class="tab" data-go="settings">设置</button>
   </nav>
 </header>
@@ -201,6 +202,18 @@
 </section>
 
 <!-- ======================= 单节课详情 ======================= -->
+<section id="view-notes" class="view" hidden>
+  <div class="card">
+    <h2>所有总结 <em class="opt">每节课的概要都在这里，点「编辑」直接改</em></h2>
+    <div class="notes-bar">
+      <input id="notesQ" type="search" placeholder="搜索总结里的内容…">
+      <select id="notesCourse"></select>
+      <button class="ghost" id="btnArchiveOpen" hidden>📂 打开存档文件夹</button>
+    </div>
+    <div id="notesList"></div>
+  </div>
+</section>
+
 <section id="view-session" class="view" hidden>
   <div class="card">
     <button class="ghost back" data-go="library">← 返回资料库</button>
@@ -246,7 +259,22 @@
       <button class="stab" data-pane="audio">🎧 录音</button>
     </div>
 
-    <div id="pane-sum" class="pane markdown"></div>
+    <div id="pane-sum-wrap">
+      <div class="sum-tools">
+        <button class="ghost" id="btnSumEdit">✏️ 编辑概要</button>
+        <span class="muted" id="sumArchive"></span>
+      </div>
+      <div id="pane-sum" class="pane markdown"></div>
+      <div id="sumEditor" hidden>
+        <textarea id="sumText" rows="18" spellcheck="false"></textarea>
+        <div class="sum-edit-bar">
+          <span class="muted">支持 Markdown：# 标题、- 列表、**加粗**。保存后会同步更新存档。</span>
+          <span class="grow"></span>
+          <button class="ghost" id="btnSumCancel">取消</button>
+          <button class="primary" id="btnSumSave">保存</button>
+        </div>
+      </div>
+    </div>
     <div id="pane-full" class="pane" hidden>
       <div id="playBar" class="playbar" hidden>
         <button class="ghost" id="pbPlay" title="播放 / 暂停（空格）">▶</button>
@@ -449,6 +477,21 @@
       <button class="ghost" id="btnPurgeChunks">🧹 清理所有分段音频</button>
       <button class="ghost" id="btnPurgeAudio">🧹 清理所有录音（保留文字）</button>
       <button class="danger" id="btnWipe">🗑 清空全部数据</button>
+    </div>
+
+    <div id="archiveBox" hidden>
+      <h3>录音存档</h3>
+      <p class="muted">每节课下课后，自动在 App 外面存一份：录音 + 概要 + 中英讲稿 + 课程包。
+        App 删了、电脑坏了，只要这个文件夹还在（云盘会自动同步），东西就都在。</p>
+      <div class="upd-row">
+        <span>存在：<b id="archiveWhere">—</b></span>
+      </div>
+      <div class="upd-row">
+        <select id="selArchive"></select>
+        <button class="ghost" id="btnArchiveOpen2">📂 打开</button>
+        <button class="ghost" id="btnArchiveAll">把以前的课全部存一遍</button>
+      </div>
+      <p class="muted" id="archiveMsg"></p>
     </div>
 
     <h3>关于</h3>

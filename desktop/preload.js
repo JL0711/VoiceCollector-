@@ -148,6 +148,13 @@ const VCDesktop = {
    * 更新（只换网页层，约 1MB；见 desktop/lib/updater.js）。
    * 流程：checkUpdate() → 有新版就提示 → 用户点了才 installUpdate() → relaunchForUpdate()。
    */
+  /** 录音留档：每节课一个文件夹，通用格式，放在 App 外面（默认 iCloud 云盘） */
+  archive: {
+    defaultRoot: () => ipcRenderer.invoke('vc:archive-default'),
+    write: (root, rel, data) => ipcRenderer.invoke('vc:archive-write', { root, rel, data }),
+    open: dir => ipcRenderer.invoke('vc:archive-open', dir)
+  },
+
   /** 旧端口数据迁移：界面启动时取一次，合并完报账（见 main.js migrateOrigins） */
   migration: {
     take: () => ipcRenderer.invoke('vc:migration-take'),
