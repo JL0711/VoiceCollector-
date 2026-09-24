@@ -1,7 +1,7 @@
 // 导出：Markdown / Word(.doc) / 纯文本 / 字幕 / JSON
 import { mmss, dateCN, dateFile, esc, md2html, download } from './util.js';
 
-const BRAND = 'VoiceCollector · 晗晗专属';
+const BRAND = 'VoiceCollector';
 
 function meta(s, ctx) {
   return { teacher: ctx.teacher || '未填写', course: ctx.course || '未填写' };

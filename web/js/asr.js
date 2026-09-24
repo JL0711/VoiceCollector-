@@ -1,6 +1,13 @@
 // 实时语音识别：Web Speech API + 自动重连 + 看门狗
 // 这是整个应用最关键的部分——必须保证从头到尾都在听。
-export const SR_SUPPORTED = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+// ⚠️ 不能拿「构造函数在不在」当「功能能不能用」。
+// Electron 的 Chromium 里 webkitSpeechRecognition **是存在的**，但 Electron 不带
+// Google 的语音后端，一 start() 立刻 error（network / not-allowed），然后无限重连，
+// 界面上就永远挂着一条红色的「识别服务网络异常，正在自动重连…」，而且一个字都出不来。
+// 所以桌面版直接判定为不支持，一律走本地 Whisper —— 它离线、对远场更准、
+// 而且不用把教授的声音传给任何人。浏览器里（Chrome/Edge）照旧用实时识别。
+export const IS_DESKTOP = !!(window.VCDesktop && window.VCDesktop.isDesktop);
+export const SR_SUPPORTED = !IS_DESKTOP && !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 
 const WATCHDOG_MS = 25000;   // 25 秒完全没有任何音频事件 → 判定引擎假死，强制重启
 const MAX_BACKOFF = 3000;

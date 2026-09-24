@@ -2,6 +2,7 @@
 import { ask, aiReady } from './ai.js';
 import { translate, withTimeout } from './translate.js';
 import { mmss } from './util.js';
+import { IS_DESKTOP } from './asr.js';
 
 const SYS = `你是一位顶尖的学习助理，正在帮一位中国留学生整理大学课堂笔记。
 输入是课堂录音的自动转写稿（可能有识别错误、口语、重复，请自行判断并纠正明显的错词）。
@@ -115,8 +116,22 @@ async function cloudSummary(text, session, ctx, onStep) {
 }
 
 async function builtinSummary(text, onStep) {
+  // ⚠️ 这里踩过和 asr.js 顶部一模一样的坑，而且更阴险 —— 它不报错，它「成功」返回垃圾。
+  // Electron 44 / Chromium 152 里实测：
+  //     self.Summarizer            → function（壳子在 Blink 里，所以 if (!S) 拦不住）
+  //     S.availability()           → 'downloadable'（模型根本没就绪）
+  //     S.create(...)              → 成功返回对象（所以 if (!s) 也拦不住）
+  //     s.summarize(讲稿)          → "Model not available in Chromium\n" + 原样吐回讲稿
+  // 于是 builtinSummary 返回非空字符串，summarize() 立刻 return，
+  // localnlp.js 那套真正的离线分析（定义/考点/作业/术语）一行都不会跑，
+  // 她下课拿到的「课堂笔记」就是一句英文报错加一遍英文讲稿复读。
+  if (IS_DESKTOP) return '';
   const S = self.Summarizer || (self.ai && self.ai.summarizer);
   if (!S) return '';
+  // 必须先问可用性再 create —— translate.js 的 prepare() 一直是这么做的，这里以前漏了。
+  let av = 'unavailable';
+  try { av = await withTimeout(S.availability(), 3000, 'unavailable'); } catch (_) {}
+  if (av !== 'available') return '';
   onStep('使用 Chrome 内置摘要…');
   const mk = async (opts) => { try { return await withTimeout(S.create(opts), 60000, null); } catch (_) { return null; } };
   const opts = { type: 'key-points', format: 'markdown', length: 'long',
@@ -132,6 +147,11 @@ async function builtinSummary(text, onStep) {
   try { s.destroy && s.destroy(); } catch (_) {}
   let md = out.join('\n');
   if (!md.trim()) return '';
+  // 双保险：万一哪天别的 Chromium 也回桩，或者摘要器把原文原样吐回来，
+  // 宁可返回空让它落到离线分析，也不能把「一句报错 + 英文讲稿复读」当成她的课堂笔记。
+  if (/model not available/i.test(md)) return '';
+  const strip = x => x.replace(/\s+/g, '');
+  if (strip(md).includes(strip(text).slice(0, 80))) return '';
   if (!/[一-龥]/.test(md)) {
     onStep('翻译摘要…');
     const zh = await translate(md.slice(0, 5000), 'en', 'zh-Hans');

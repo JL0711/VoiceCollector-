@@ -219,3 +219,84 @@ dialog menu{display:flex;gap:10px;justify-content:flex-end;padding:0;margin:18px
 .sb-mid{background:#f59e0b22;color:#ffd79a;border:1px solid #f59e0b55}
 .sb-slow{background:#ef444422;color:#ffb4b4;border:1px solid #ef444455}
 .rec-on{background:#ef4444!important;border-color:#ef4444!important;color:#fff!important;animation:blink 1s infinite}
+
+/* ── 回听清单 ─────────────────────────────────────── */
+.pace-card{background:linear-gradient(135deg,#1a2138,#151a2b);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+.pace-card .big{font-size:34px;font-weight:700;font-variant-numeric:tabular-nums;line-height:1.1}
+.pace-card .unit{font-size:14px;color:var(--mut);font-weight:400;margin-left:6px}
+.pace-card .tag{display:inline-block;font-size:12px;padding:3px 10px;border-radius:999px;margin-left:10px;vertical-align:middle}
+.pace-slow{background:#22c55e22;color:#a7f3c8;border:1px solid #22c55e55}
+.pace-normal{background:#3ba7ff22;color:#a9d6ff;border:1px solid #3ba7ff55}
+.pace-fast{background:#f59e0b22;color:#ffd79a;border:1px solid #f59e0b55}
+.pace-veryfast{background:#ef444422;color:#ffb4b4;border:1px solid #ef444455}
+.pace-card p{margin:10px 0 0;font-size:14px;color:#cfd8ef;line-height:1.65}
+.miss-list{display:flex;flex-direction:column;gap:9px;margin-top:10px}
+.miss-item{background:#0d1120;border:1px solid var(--line);border-left:3px solid #2c3453;border-radius:10px;padding:10px 13px}
+.miss-item.sev-high{border-left-color:var(--bad)}
+.miss-item.sev-mid{border-left-color:var(--warn)}
+.miss-item.sev-low{border-left-color:#3ba7ff}
+.miss-item .hd{display:flex;align-items:center;gap:8px;font-size:11.5px;color:#5f6d8f;margin-bottom:4px}
+.miss-item .hd button{padding:2px 8px;font-size:12px;border-radius:6px}
+.miss-item .en{font-size:14.5px}
+.miss-item .zh{font-size:14px;color:#a9e6c0;margin-top:3px}
+.miss-item .why{font-size:12px;color:var(--mut);margin-top:6px;line-height:1.55}
+/* 实时字幕按强调程度上色 */
+.seg.emph1{border-left-color:#3ba7ff}
+.seg.emph2{border-left-color:var(--warn);background:#f59e0b0a}
+.seg.emph2 .en{font-weight:600}
+
+/* 藏起来的那一页（连点 5 下图标才出来） */
+#dlgHi{max-width:400px}
+.ded{text-align:center}
+.ded-mark{width:44px;height:44px;margin:2px auto 14px;border-radius:14px;position:relative;
+  background:linear-gradient(145deg,var(--acc),#7c5cff)}
+.ded-mark::after{content:"";position:absolute;inset:12px 15px 10px;border-radius:9px 9px 7px 7px;
+  background:#fff;opacity:.95}
+.ded h3{margin:0 0 14px;font-size:17px;letter-spacing:.06em}
+.ded p{margin:0 0 11px;line-height:1.85;color:var(--mut);font-size:13.5px;text-align:left}
+.ded p b{color:var(--fg)}
+.ded-end{text-align:center!important;color:var(--fg)!important;margin-top:16px!important;
+  font-size:14.5px;letter-spacing:.04em}
+
+/* 纯 Whisper 模式下等第一段字时的提示 */
+.waiting{padding:26px 20px;text-align:center}
+.waiting-dots{display:flex;gap:7px;justify-content:center;margin-bottom:16px}
+.waiting-dots i{width:8px;height:8px;border-radius:50%;background:var(--acc);opacity:.35;
+  animation:wdot 1.4s ease-in-out infinite}
+.waiting-dots i:nth-child(2){animation-delay:.2s}
+.waiting-dots i:nth-child(3){animation-delay:.4s}
+@keyframes wdot{0%,60%,100%{opacity:.25;transform:translateY(0)}30%{opacity:1;transform:translateY(-4px)}}
+.waiting-main{margin:0 0 9px;font-size:15px;color:var(--fg)}
+.waiting-sub{margin:0;font-size:12.5px;line-height:1.8;color:var(--mut)}
+.waiting-sub b{color:var(--fg)}
+.waiting-count{margin:14px 0 0;font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums}
+@media (prefers-reduced-motion:reduce){.waiting-dots i{animation:none;opacity:.6}}
+
+/* 更新 */
+.upd-pill{background:var(--acc);color:#fff;border:0;border-radius:999px;padding:5px 12px;
+  font-size:12.5px;cursor:pointer;margin-right:6px;animation:updIn .35s ease-out}
+.upd-pill[hidden]{display:none}
+@keyframes updIn{from{opacity:0;transform:translateY(-3px)}to{opacity:1;transform:none}}
+.upd-row{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+.upd-row[hidden]{display:none}
+#dlgUpd{max-width:430px}
+.upd-notes{margin:4px 0 12px;padding-left:18px;line-height:1.8;font-size:13.5px}
+.upd-notes:empty{display:none}
+.upd-bar{height:6px;border-radius:3px;background:var(--line);overflow:hidden;margin:10px 0 2px}
+.upd-bar[hidden]{display:none}
+.upd-bar i{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
+@media (prefers-reduced-motion:reduce){.upd-pill{animation:none}}
+
+/* ⚡ 立即开始 */
+.quick{text-align:center;padding:4px 0 18px;margin-bottom:18px;border-bottom:1px solid var(--line)}
+.quick-btn{width:100%;max-width:420px;padding:16px 20px;font-size:18px;font-weight:600;letter-spacing:.03em;
+  border:0;border-radius:14px;cursor:pointer;color:#fff;
+  background:linear-gradient(135deg,#f97316,#ef4444);box-shadow:0 6px 18px #ef444433}
+.quick-btn:hover{filter:brightness(1.06)}
+.quick-btn:active{transform:translateY(1px)}
+.quick-sub{margin:10px auto 0;max-width:460px;font-size:12.5px;line-height:1.75;color:var(--mut)}
+.quick-sub b{color:var(--fg)}
+h2 .opt{font-style:normal;font-size:12px;font-weight:400;color:var(--mut);margin-left:8px}
+.meta-miss{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:10px 14px;margin:10px 0 4px;
+  border-radius:10px;background:#f59e0b14;border:1px solid #f59e0b44;font-size:13px}
+.meta-miss[hidden]{display:none}

@@ -1,0 +1,7 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>VoiceCollector 数据迁移</title>
+<!-- 只给桌面版的主进程用：在「旧端口」的网址下打开，把那个网址下的数据库整个读出来。
+     为什么要这一页：浏览器数据按网址隔离，端口不同就读不到。
+     让 Chromium 在旧网址下读它自己的库，是唯一可靠的办法（直接解析 leveldb 太脆弱）。 -->
+<script type="module" src="js/migrate-export.js"></script>

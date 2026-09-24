@@ -1,5 +1,5 @@
 {
-  "name": "VoiceCollector · 晗晗专属课堂助手",
+  "name": "VoiceCollector · 课堂助手",
   "short_name": "VoiceCollector",
   "description": "实时记录大学课堂、自动翻译成中文、下课自动生成课堂概要与完整讲稿",
   "start_url": "./index.html",

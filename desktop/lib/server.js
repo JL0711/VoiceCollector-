@@ -131,7 +131,12 @@ function parseRange(header, size) {
 /**
  * 起一个只读的本地静态服务。
  * @param {string} root 要暴露的目录（web/ 的绝对路径）
- * @param {{ coi?: boolean, keepServiceWorker?: boolean, host?: string, port?: number }} [opt]
+ * @param {{ coi?: boolean, keepServiceWorker?: boolean, host?: string, port?: number, overlay?: string }} [opt]
+ *   overlay: 「更新层」目录，优先于 root。找得到就用它的，找不到就穿透回 root。
+ *        这样一次更新只需要下载真正变了的文件（js/css/html 加起来约 1MB），
+ *        而 vendor/（67MB）和 models/（662MB）继续用 App 内置的那份 —— 它们几乎不变。
+ *        另一个好处：这条路完全不碰 App 本体，所以不需要 Apple 代码签名
+ *        （Squirrel.Mac 那套自动更新要求正规签名，我们没有开发者账号）。
  *   coi: 是否发 COOP/COEP 头。开了之后页面处于“跨源隔离”状态，
  *        SharedArrayBuffer 可用 —— Whisper（onnxruntime-web / transformers.js）
  *        的多线程 WASM 才能跑满多核，识别快很多、也更省电（早点算完早点空闲）。
@@ -141,6 +146,7 @@ function parseRange(header, size) {
  */
 function createStaticServer(root, opt) {
   const o = opt || {};
+  const overlay = o.overlay || null;
   const coi = o.coi !== false;
   const keepSW = !!o.keepServiceWorker;
   const host = o.host || '127.0.0.1';
@@ -190,8 +196,15 @@ function createStaticServer(root, opt) {
       });
     }
 
-    const file = resolveSafe(root, pathname);
-    if (!file) return send(400, '非法路径', { 'Content-Type': 'text/plain; charset=utf-8' });
+    const base = resolveSafe(root, pathname);
+    if (!base) return send(400, '非法路径', { 'Content-Type': 'text/plain; charset=utf-8' });
+    // 更新层优先。注意 resolveSafe 对两个根都做了穿越防护，
+    // overlay 解析失败（比如 ../ ）就当没有，直接用内置那份。
+    let file = base;
+    if (overlay) {
+      const over = resolveSafe(overlay, pathname);
+      try { if (over && fs.statSync(over).isFile()) file = over; } catch (_) { /* 更新层没有就穿透 */ }
+    }
 
     fs.stat(file, (err, st) => {
       if (err || !st.isFile()) {
@@ -247,7 +260,11 @@ function createStaticServer(root, opt) {
         origin: origin,
         indexUrl: origin + '/index.html',
         root: path.resolve(root),
-        close: () => new Promise(done => server.close(() => done()))
+        // 先掐掉 keep-alive 连接，不然 server.close() 会一直等到它们自己超时（迁移时会卡住）
+        close: () => new Promise(done => {
+          try { server.closeAllConnections && server.closeAllConnections(); } catch (_) {}
+          server.close(() => done());
+        })
       });
     });
   });

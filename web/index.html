@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#0b0d14">
-<title>VoiceCollector · 晗晗专属课堂助手</title>
+<title>VoiceCollector · 课堂助手</title>
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icons/icon-192.png">
 <link rel="apple-touch-icon" href="icons/icon-192.png">
@@ -24,10 +24,11 @@
     <span class="logo" aria-hidden="true"></span>
     <div>
       <h1>VoiceCollector</h1>
-      <small>晗晗专属 · 课堂实时记录与中文翻译</small>
+      <small id="brandSub">课堂实时记录与中文翻译</small>
     </div>
   </div>
   <nav class="tabs">
+    <button class="upd-pill" id="btnUpdPill" hidden>🆕 有新版本</button>
     <button class="tab" data-go="record">录制</button>
     <button class="tab" data-go="library">资料库</button>
     <button class="tab" data-go="settings">设置</button>
@@ -40,7 +41,13 @@
 <section id="view-record" class="view">
 
   <div id="setupCard" class="card">
-    <h2>开始一节新课</h2>
+    <div class="quick">
+      <button class="quick-btn" id="btnQuick">⚡ 立即开始录音</button>
+      <p class="quick-sub">来不及设置？直接点这个。什么都不用填，下课后再补老师和学科。<br>
+        用的是最稳的一套设置，<b>完全离线</b>，网络再差也不影响。</p>
+    </div>
+
+    <h2>开始一节新课 <em class="opt">老师、学科都可以不填</em></h2>
 
     <div class="grid2">
       <label class="field">
@@ -103,8 +110,8 @@
     </div>
 
     <div class="tip">
-      ⚠️ 实时识别使用的是<b>系统默认输入设备</b>。如果你要用外接麦克风／领夹麦，请先在
-      <b>系统设置 → 声音 → 输入</b> 里把它设为默认，再回来开始录制。
+      🎤 要用外接麦克风／领夹麦，<b>直接在上面那个「麦克风」下拉框里选</b>就行，不用改系统设置。
+      插上之后如果列表里没有，点一下下拉框会自动刷新。选完点「麦克风试音」确认音量条在动。
     </div>
 
     <div class="diag" id="diag"></div>
@@ -199,6 +206,10 @@
     <button class="ghost back" data-go="library">← 返回资料库</button>
     <h2 id="sTitle">—</h2>
     <div class="smeta" id="sMeta">—</div>
+    <div class="meta-miss" id="sMetaMiss" hidden>
+      <span>这节课还没填老师和学科（快速开始录的）。补上之后按老师/学科整理、期中期末复习都能找到它。</span>
+      <button class="primary" id="btnFillMeta">现在补上</button>
+    </div>
 
     <div class="export-row">
       <button class="primary big" id="exFullDoc">📄 导出老师说的每一句话（Word）</button>
@@ -229,6 +240,7 @@
     <div class="stabs">
       <button class="stab active" data-pane="sum">📋 课堂概要</button>
       <button class="stab" data-pane="full">📄 完整讲稿</button>
+      <button class="stab" data-pane="coach">🎧 回听清单</button>
       <button class="stab" data-pane="notes">📝 我的笔记</button>
       <button class="stab" data-pane="study">📘 复习文档</button>
       <button class="stab" data-pane="audio">🎧 录音</button>
@@ -257,6 +269,16 @@
       <input id="fullSearch" type="search" placeholder="在讲稿中搜索…">
       <div id="fullBody" class="transcript static"></div>
     </div>
+    <div id="pane-coach" class="pane" hidden>
+      <div id="paceCard" class="pace-card"></div>
+      <h3 style="margin-top:20px">⏱ 三分钟速览</h3>
+      <p class="muted">下课路上花三分钟过一遍，点 ▶ 直接听原声。</p>
+      <div id="recapList" class="miss-list"></div>
+      <h3 style="margin-top:22px">🎯 你可能没跟上的句子</h3>
+      <p class="muted">综合语速、句长、生词密度、你的标记等信号挑出来的。**优先听这些**，比从头听一遍高效得多。</p>
+      <div id="missList" class="miss-list"></div>
+    </div>
+
     <div id="pane-notes" class="pane" hidden>
       <p class="muted">把你自己在课上记的笔记贴进来（手写的可以先打字/拍照转文字）。写完会自动保存。</p>
       <textarea id="myNotes" rows="16" placeholder="例如：&#10;- 弹性 elasticity = %ΔQ / %ΔP&#10;- 老师说期中会考这个&#10;- HW4 下周五交&#10;- 没听懂：consumer surplus 那一段"></textarea>
@@ -347,10 +369,10 @@
     <h3>省电</h3>
     <label class="check"><input type="checkbox" id="setPower"> <b>省电模式</b>（没插电、课特别长的时候开）</label>
     <p class="muted">
-      打开后：只跑浏览器实时识别（不跑本地 Whisper）、翻译从 8 秒一批改成 20 秒一批、
-      音量表从 8fps 降到 2fps、不阻止屏幕休眠。<br>
-      代价：最终讲稿的准确率会降一些（没有 Whisper 校正），远距离尤其明显。
-      <b>大教室别开这个</b>，宁可插电。
+      打开后：翻译从 8 秒一批改成 20 秒一批、音量表从 8fps 降到 2fps、不阻止屏幕休眠。<br>
+      <b>桌面 App 里开这个不掉准确率</b> —— 识别本来就全靠本地 Whisper，省电模式不会关掉它，
+      只是把界面刷新和翻译放慢。没插电、课又长的时候放心开。<br>
+      <span class="muted">（在浏览器里打开这个页面时才有区别：那时省电会停掉本地 Whisper 只留浏览器识别，远距离准确率会降。）</span>
     </p>
 
     <h3>识别与录音</h3>
@@ -389,9 +411,10 @@
       <input type="range" id="setBoost" min="1" max="8" step="0.5" value="1"></label>
     <label class="check"><input type="checkbox" id="setKeepChunks"> 保存分段音频（下课后可以用云端整段重新转写，准确率高很多）</label>
     <p class="muted">
-      ⚠️ 说实话：浏览器的<b>实时</b>识别用的是它自己抓的音频，上面的增强<b>帮不到实时字幕</b>——离得远，实时字幕一定会变差。<br>
-      增强和分段保存作用在<b>录音</b>上。所以大教室的正确用法是：<b>开启远距离模式 + 保存分段音频，下课后点那节课里的「☁︎ 用云端重新转写整节课」</b>，
-      用 Whisper 把整节课重转一遍，它对远场和噪声的鲁棒性强得多。需要在上面配置 OpenAI 兼容的 API Key。<br>
+      大教室的正确用法：<b>开启远距离模式</b>（它会自动换成更准的 whisper-small，并对音频做大厅增强）。<br>
+      上课时离得远、字幕有错是正常的。下课后到那节课里点
+      <b>「🖥 用录音重新识别整节课（本地，免费）」</b> —— 用整段录音重跑一遍，比边录边出的准得多，
+      <b>不用联网、不用 API Key、不花钱</b>。旁边的「☁︎ 用云端重新转写」是可选的，需要自己配 Key，不配也完全够用。<br>
       分段音频大约每小时多占 25–30 MB，转写完可以在下面删掉。
     </p>
 
@@ -429,8 +452,12 @@
     </div>
 
     <h3>关于</h3>
-    <p class="muted">VoiceCollector · 晗晗专属 · 全部数据只存在本机浏览器里。<br>
-    建议使用 <b>Chrome</b> 或 <b>Edge</b>（最新版）。Safari 不支持实时语音识别。</p>
+    <p class="muted" id="aboutText">VoiceCollector · 全部数据只存在这台电脑上，不上传任何地方。</p>
+    <div class="upd-row" id="updRow" hidden>
+      <span id="updVer" class="muted"></span>
+      <button class="ghost" id="btnUpdCheck">检查更新</button>
+      <button class="ghost" id="btnUpdRevert" hidden title="新版本有问题时，退回 App 自带的版本">退回上一版</button>
+    </div>
   </div>
 </section>
 
@@ -454,6 +481,38 @@
     <button class="ghost" id="aiSave">⬇ 存成文件</button>
     <button class="primary" id="aiClose">关闭</button>
   </menu>
+</dialog>
+
+<!-- 藏起来的那一页：连点左上角图标 5 下才出来。
+     晗晗不用一打开 App 就看见「专属」两个字，但想看的时候随时点得开。 -->
+<dialog id="dlgUpd">
+  <h3 id="updTitle">有新版本</h3>
+  <ul id="updNotes" class="upd-notes"></ul>
+  <p id="updMsg" class="muted"></p>
+  <div class="upd-bar" id="updBar" hidden><i id="updBarFill"></i></div>
+  <menu>
+    <button class="ghost" id="btnUpdLater">以后再说</button>
+    <button class="primary" id="btnUpdGo">更新</button>
+  </menu>
+</dialog>
+
+<dialog id="dlgHi">
+  <div class="ded">
+    <div class="ded-mark" aria-hidden="true"></div>
+    <h3>给晗晗</h3>
+    <p>这个东西是专门给你做的。</p>
+    <p>刚过来跟不上老师说话的速度，太正常了 ——
+       托福听力大概每分钟 150 个词，这边大学的课能冲到 185。
+       <b>不是你不行，是真的快。</b></p>
+    <p>听不懂就点一下「标记重点」，接着往下听，别停。
+       下课回来慢慢听，0.75 倍速，一句一句来。</p>
+    <p class="ded-end">慢慢来，来得及。</p>
+  </div>
+  <form method="dialog">
+    <menu>
+      <button value="ok" class="primary">好</button>
+    </menu>
+  </form>
 </dialog>
 
 <dialog id="dlg">

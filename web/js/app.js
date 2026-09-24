@@ -1,7 +1,7 @@
 import { $, $$, uid, hhmmss, mmss, dateCN, esc, words, download, debounce, md2html } from './util.js';
 import * as db from './db.js';
 import { settings, save as saveSettings, PRESETS, LANGS } from './store.js';
-import { ASR, SR_SUPPORTED } from './asr.js';
+import { ASR, SR_SUPPORTED, IS_DESKTOP } from './asr.js';
 import { Mic, listMics, keepAwake } from './mic.js';
 import * as T from './translate.js';
 import { summarize, localSummary } from './summarize.js';
@@ -22,6 +22,12 @@ const S = {
 
 const LIVE_KEEP = 120;   // 实时视图最多保留多少条
 
+// 实时判断「老师在不在强调这句」，用来给字幕上色。
+// ⚠️ 不能在模块顶层就 mod('coach') —— 那时 lazy 还在暂时性死区（TDZ），
+//    抛出的 ReferenceError 会被 .catch 吞掉，表现为「上色功能静默失效」。
+//    所以放到 init() 里加载。
+let COACH_EMPH = null;
+
 // 绑事件的安全包装：元素不存在时只警告，不让整个 init 崩掉。
 // （之前就吃过亏：HTML 里少了一个 id，init 抛异常中断，**后面所有按钮全部没绑上**，
 //   表面上看是「有些功能点了没反应」，极难排查。）
@@ -30,10 +36,6 @@ function on(sel, evt, fn) {
   if (!el) { console.warn('[VC] 找不到元素，跳过绑定：' + sel); return null; }
   el.addEventListener(evt, fn);
   return el;
-}
-function setv(sel, prop, val) {
-  const el = document.querySelector(sel);
-  if (el) el[prop] = val;
 }
 
 const toast = (msg, ms = 2600) => {
@@ -51,6 +53,9 @@ function dialog(title, fields, okText = '确定') {
       <label class="field"><span>${esc(f.label)}</span>
       ${f.type === 'select'
         ? `<select name="${f.name}">${f.options.map(o => `<option value="${esc(o.v)}" ${o.v === f.value ? 'selected' : ''}>${esc(o.t)}</option>`).join('')}</select>`
+        : f.type === 'combo'
+        ? `<input name="${f.name}" type="text" list="dl-${f.name}" value="${esc(f.value || '')}" placeholder="${esc(f.placeholder || '')}" autocomplete="off">
+           <datalist id="dl-${f.name}">${(f.options || []).map(o => `<option value="${esc(o)}">`).join('')}</datalist>`
         : f.type === 'textarea'
         ? `<textarea name="${f.name}" rows="3" placeholder="${esc(f.placeholder || '')}">${esc(f.value || '')}</textarea>`
         : `<input name="${f.name}" type="text" value="${esc(f.value || '')}" placeholder="${esc(f.placeholder || '')}">`}
@@ -94,9 +99,17 @@ async function loadLists() {
   S.teachers = (await db.all('teachers')).sort((a, b) => a.name.localeCompare(b.name, 'zh'));
   S.courses = (await db.all('courses')).sort((a, b) => a.name.localeCompare(b.name, 'zh'));
   const st = settings();
-  const pick = (list, last) => (list.some(x => x.id === last) ? last : (list.length === 1 ? list[0].id : ''));
-  fillSelect($('#selTeacher'), S.teachers, pick(S.teachers, st.lastTeacher), '— 请选择老师 —');
-  fillSelect($('#selCourse'), S.courses, pick(S.courses, st.lastCourse), '— 请选择学科 —');
+  // 优先保留「界面上现在选的那个」。
+  // 因为新增学科也会调 loadLists()，而它会把两个下拉框都重建一遍 ——
+  // 只认 settings 里的 lastTeacher 的话，刚新增并选好的老师会在这次重建里被清掉，
+  // 接着点「开始录制」就会莫名其妙弹「请先选择老师」。开学第一节课最容易踩到。
+  const cur = sel => { const el = $(sel); return el ? el.value : ''; };
+  const pick = (list, ...prefer) => {
+    for (const id of prefer) if (id && list.some(x => x.id === id)) return id;
+    return list.length === 1 ? list[0].id : '';
+  };
+  fillSelect($('#selTeacher'), S.teachers, pick(S.teachers, cur('#selTeacher'), st.lastTeacher), '— 不选也可以 —');
+  fillSelect($('#selCourse'), S.courses, pick(S.courses, cur('#selCourse'), st.lastCourse), '— 不选也可以 —');
 }
 function fillSelect(el, list, selected, placeholder) {
   el.innerHTML = `<option value="">${placeholder}</option>` +
@@ -115,6 +128,126 @@ async function addEntity(store, label) {
   return item;
 }
 
+function bindDedication() {
+  const logo = document.querySelector('.brand .logo');
+  if (!logo) return;
+  logo.style.cursor = 'pointer';
+  logo.title = '';                       // 不给提示，不然就不叫藏了
+  let n = 0, t = null;
+  logo.onclick = () => {
+    n++;
+    clearTimeout(t);
+    t = setTimeout(() => { n = 0; }, 3000);   // 3 秒内连点才算
+    if (n < 5) return;
+    n = 0;
+    const d = $('#dlgHi');
+    if (d && !d.open) d.showModal();
+  };
+}
+
+/* ============================== 更新 ============================== */
+// 只换网页层（约 1MB），不碰 App 本体，不需要签名 —— 见 desktop/lib/updater.js。
+// 规矩：
+//   · 发现新版只亮一个小按钮，**绝不弹窗打断**，更不会在录制中动任何东西
+//   · 她点了才下载；下载完也要她点「重启生效」
+//   · 新版本起不来会自动退回（main 进程的 .pending 机制），设置里也有手动「退回上一版」
+const QUICK_MODEL = 'onnx-community/whisper-base';
+const UPD = () => (IS_DESKTOP && window.VCDesktop && window.VCDesktop.update) || null;
+let UPD_INFO = null;
+
+async function checkUpdate({ silent = false } = {}) {
+  const U = UPD(); if (!U) return null;
+  let r;
+  try { r = await U.check(); } catch (e) { r = { available: false, reason: '检查失败：' + e.message }; }
+  UPD_INFO = r && r.available ? r : null;
+  $('#btnUpdPill').hidden = !UPD_INFO;
+  if (!silent) {
+    if (UPD_INFO) openUpdateDialog();
+    else toast(r && r.reason ? r.reason : '已经是最新版', 3500);
+  }
+  return r;
+}
+
+function openUpdateDialog() {
+  const r = UPD_INFO; if (!r) return;
+  const d = $('#dlgUpd');
+  $('#updTitle').textContent = '新版本 ' + r.version;
+  $('#updNotes').innerHTML = (r.notes || []).map(n => `<li>${esc(n)}</li>`).join('');
+  $('#updBar').hidden = true; $('#updBarFill').style.width = '0';
+  const go = $('#btnUpdGo'), later = $('#btnUpdLater');
+  go.disabled = false; later.disabled = false;
+  if (S.cur) {
+    $('#updMsg').textContent = '正在录课，现在不更新。下课点「结束」之后再来点这里。';
+    go.hidden = true;
+  } else if (r.full) {
+    $('#updMsg').textContent = r.reason || '这次需要下载完整安装包。';
+    go.hidden = false; go.textContent = '去下载';
+    go.onclick = () => { U_open(r.pageUrl); d.close(); };
+  } else {
+    const mb = r.size ? (r.size / 1048576).toFixed(1) + ' MB' : '';
+    $('#updMsg').textContent = `只更新界面和程序逻辑${mb ? '（' + mb + '）' : ''}，识别模型不用重新下载。你的课程和录音不受影响。`;
+    go.hidden = false; go.textContent = '更新';
+    go.onclick = () => installUpdate();
+  }
+  later.onclick = () => d.close();
+  if (!d.open) d.showModal();
+}
+
+function U_open(url) { const U = UPD(); if (U && url) U.openPage(url); }
+
+async function installUpdate() {
+  const U = UPD(); if (!U || !UPD_INFO) return;
+  if (S.cur) return toast('正在录课，下课再更新');
+  const go = $('#btnUpdGo'), later = $('#btnUpdLater');
+  go.disabled = true; later.disabled = true;
+  $('#updBar').hidden = false;
+  $('#updMsg').textContent = '正在下载…';
+  const off = U.onProgress(p => { $('#updBarFill').style.width = Math.round(p * 100) + '%'; });
+  let r;
+  try { r = await U.install(); } catch (e) { r = { ok: false, reason: e.message }; }
+  off();
+  later.disabled = false;
+  if (!r || !r.ok) {
+    $('#updMsg').textContent = '没装成：' + ((r && r.reason) || '未知原因') + '。现在的版本照常能用。';
+    go.disabled = false; go.textContent = '重试';
+    return;
+  }
+  $('#updBarFill').style.width = '100%';
+  $('#updMsg').textContent = '装好了，重启一下就生效（几秒钟）。';
+  $('#btnUpdPill').hidden = true;
+  go.disabled = false; go.textContent = '重启生效';
+  go.onclick = () => { if (S.cur) return toast('正在录课，下课再重启'); U.relaunch(); };
+  later.textContent = '下次打开再说';
+}
+
+async function bindUpdater() {
+  const U = UPD(); if (!U) return;
+  // 能跑到这里 = 这个网页层能正常起来，告诉主进程撤掉 .pending（否则下次启动会自动退回）
+  try { await U.bootOk(); } catch (_) {}
+
+  $('#btnUpdPill').onclick = openUpdateDialog;
+  $('#btnUpdCheck').onclick = () => checkUpdate({ silent: false });
+  $('#btnUpdRevert').onclick = () => {
+    if (S.cur) return toast('正在录课，下课再说');
+    if (confirm('退回 App 自带的版本？你的课程和录音都不受影响。')) U.revert();
+  };
+
+  let st = null;
+  try { st = await U.state(); } catch (_) {}
+  if (st) {
+    $('#updRow').hidden = false;
+    $('#updVer').textContent = '版本 ' + st.current + (st.usingUpdate ? '（已在线更新）' : '');
+    $('#btnUpdRevert').hidden = !st.usingUpdate;
+  }
+
+  // 开 App 10 秒后悄悄查一次。只亮顶栏小按钮，不弹窗。
+  // 正在录课、或者没联网，都直接跳过，什么也不说。
+  setTimeout(() => {
+    if (S.cur || !navigator.onLine) return;
+    checkUpdate({ silent: true }).catch(() => {});
+  }, 10000);
+}
+
 /* ============================== 诊断 ============================== */
 async function renderDiag() {
   const box = $('#diag');
@@ -122,7 +255,14 @@ async function renderDiag() {
   const push = (c, t) => items.push([c, t]);
   const draw = () => box.innerHTML = items.map(([c, t]) => `<span class="${c}">${esc(t)}</span>`).join('');
 
-  push(SR_SUPPORTED ? 'ok' : 'no', SR_SUPPORTED ? '✓ 浏览器支持实时识别' : '✗ 此浏览器不支持实时识别 — 请用 Chrome/Edge');
+  // 桌面版 SR_SUPPORTED 恒为 false（asr.js 顶部），但那是**设计如此**，不是坏了。
+  // 直接拿它当好/坏上色的话，她一打开 App 第一眼就是「开始录制」按钮正上方一条红色的
+  // 「✗ 此浏览器不支持实时识别 — 请用 Chrome/Edge」—— 在一个我们让她用的桌面 App 里，
+  // 还指她去用手边没有的 Chrome。她不会调试，只会得出「坏了」或者「不敢点」。
+  push(IS_DESKTOP || SR_SUPPORTED ? 'ok' : 'no',
+       IS_DESKTOP    ? '✓ 本地 Whisper 识别（离线，断网也能用）'
+     : SR_SUPPORTED  ? '✓ 浏览器支持实时识别'
+     :                 '✗ 此浏览器不支持实时识别 — 请用 Chrome/Edge');
   push(window.isSecureContext ? 'ok' : 'no', window.isSecureContext ? '✓ 安全上下文' : '✗ 非 https/localhost，麦克风不可用');
   const st = settings();
   push(aiReady() ? 'ok' : 'mid', aiReady() ? '✓ AI 已配置：' + aiName() : '· 未配置 AI（概要将用离线算法）');
@@ -130,7 +270,14 @@ async function renderDiag() {
 
   let perm = 'prompt';
   try { perm = (await navigator.permissions.query({ name: 'microphone' })).state; } catch (_) {}
-  items.splice(2, 0, perm === 'granted' ? ['ok', '✓ 麦克风已授权']
+  // 桌面版：navigator.permissions 报的是 Chromium 内部的状态，
+  // 真正会卡住她的是 macOS 系统级的麦克风权限（TCC），这里看不见。
+  // 所以别给一个可能是假的绿勾，直接告诉她怎么自查。
+  items.splice(2, 0, IS_DESKTOP
+    ? (perm === 'denied'
+        ? ['no', '✗ 麦克风被拒绝 — 系统设置 → 隐私与安全性 → 麦克风，勾上 VoiceCollector']
+        : ['mid', '· 麦克风：点下面「麦克风试音」确认音量条在动'])
+    : perm === 'granted' ? ['ok', '✓ 麦克风已授权']
     : perm === 'denied' ? ['no', '✗ 麦克风被拒绝 — 点地址栏左侧图标开启']
     : ['mid', '· 麦克风待授权（点开始时会询问）']);
   draw();
@@ -205,6 +352,11 @@ async function micTest() {
 function resolveEngine() {
   const st = settings();
   const e = st.engine || 'auto';
+  // 桌面版没有浏览器实时识别（见 asr.js 顶部）。
+  // 这里必须把**存档里的旧值**也纠正过来 —— 她之前在浏览器里用过 hybrid，
+  // 那个值会一直留在 localStorage 里，不纠正的话装了桌面版还是会去启动一个
+  // 永远连不上的引擎，然后一直弹「识别服务网络异常」。
+  if (IS_DESKTOP && (e === 'webspeech' || e === 'hybrid')) return 'whisper';
   if (e !== 'auto') return e;
   if (!SR_SUPPORTED) return 'whisper';      // Electron 桌面版 / Safari：浏览器实时识别不可用
   // 省电模式只跑一个引擎（浏览器识别几乎不耗本机算力，是在 Google 服务器上算的）
@@ -240,7 +392,7 @@ async function startWhisperEngine(mic, st, engine) {
     if (code === 'downloading') setStatus('warn', `下载识别模型 ${pct != null ? Math.round(pct) + '%' : '…'}`);
     else if (code === 'loading') setStatus('warn', '加载识别模型…');
     else if (code === 'ready') setStatus('rec', '录音中');
-    else if (code === 'lagging') showWarn('电脑有点跟不上，识别在排队。可以在设置里换一个更小的 Whisper 模型。');
+    else if (code === 'lagging') showWarn('电脑有点跟不上，识别在排队 —— 字幕会延后，但录音一个字都不会少，下课后能重新转写。上课中不用管它。');
     else if (code === 'error') showWarn('Whisper 引擎出错：' + ((x && x.message) || '未知') + '。录音仍在继续，下课后可以重新转写。');
   };
 
@@ -305,19 +457,27 @@ async function stopWhisperEngine() {
 }
 
 /* ============================== 录制 ============================== */
-async function startRecording() {
-  const teacherId = $('#selTeacher').value, courseId = $('#selCourse').value;
-  if (!teacherId) return toast('请先选择老师（没有就点 ＋ 新增）');
-  if (!courseId) return toast('请先选择学科（没有就点 ＋ 新增）');
+// quick = 「⚡ 立即开始」：紧急情况下不填任何东西直接录，下课再补老师/学科/标题。
+// 老师和学科现在都是可选的 —— 以前不选就不让录，开学第一节课手忙脚乱时最容易卡在这。
+async function startRecording({ quick = false } = {}) {
+  if (S.cur) return;
+  const teacherId = quick ? '' : ($('#selTeacher').value || '');
+  const courseId  = quick ? '' : ($('#selCourse').value || '');
 
-  const st = saveSettings({
+  const saved = saveSettings({
     srcLang: $('#selSrcLang').value,
     dstLang: $('#selDstLang').value,
     micId: $('#selMic').value,
-    lastTeacher: teacherId, lastCourse: courseId
+    ...(quick ? {} : { lastTeacher: teacherId, lastCourse: courseId })
   });
+  // 快速开始只用最稳的一套，**不改她保存的设置**：
+  //   本地 Whisper + 内置 whisper-base（1.4 秒加载、32 倍实时，最不容易卡），
+  //   不开大教室增强、不开自动精修。全程离线，网络再差也不受影响。
+  const st = quick
+    ? { ...saved, engine: 'whisper', whisperModel: QUICK_MODEL, farMode: false, boost: 1, autoPerfect: false }
+    : saved;
 
-  const engine = resolveEngine();
+  const engine = quick ? 'whisper' : resolveEngine();
   const boost = st.farMode ? Math.max(2, st.boost) : st.boost;
 
   // 远场音频链（audio.js 里针对大教室 + 扩音器调过参）
@@ -350,15 +510,18 @@ async function startRecording() {
     }
   }
 
-  const title = $('#inpTitle').value.trim() ||
-    `${nameOf(S.courses, courseId)} ${new Date().toLocaleDateString('zh-CN')}`;
+  const now = new Date();
+  const title = (!quick && $('#inpTitle').value.trim()) ||
+    (quick ? `快速记录 ${now.toLocaleDateString('zh-CN')} ${now.toTimeString().slice(0, 5)}`
+           : `${nameOf(S.courses, courseId) || '课堂记录'} ${now.toLocaleDateString('zh-CN')}`);
 
   S.cur = {
     id: uid(), teacherId, courseId, title,
     startedAt: Date.now(), endedAt: null, durationMs: 0,
     srcLang: st.srcLang, dstLang: st.dstLang,
     segments: [], summary: '', hasAudio: false,
-    engine, farMode: !!st.farMode, boost
+    engine, farMode: !!st.farMode, boost, quick: !!quick,
+    wmodel: (engine === 'whisper' || engine === 'hybrid') ? (st.whisperModel || '') : ''
   };
   await db.put('sessions', S.cur);
 
@@ -367,13 +530,25 @@ async function startRecording() {
   FRAG.reset();
   $('#setupCard').hidden = true; $('#liveCard').hidden = false; $('#warnBox').hidden = true;
   $('#liveTitle').textContent = title;
-  $('#liveMeta').textContent = `${nameOf(S.courses, courseId)} · ${nameOf(S.teachers, teacherId)}`;
+  $('#liveMeta').textContent = (courseId || teacherId)
+    ? [nameOf(S.courses, courseId), nameOf(S.teachers, teacherId)].filter(Boolean).join(' · ')
+    : '没填老师和学科 —— 下课后在这节课里点「✏️ 修改信息」补上就行';
   $('#liveTranscript').innerHTML = ''; $('#interim').textContent = '';
+  // 纯 Whisper 是 25 秒一个窗口才出第一段字。这 25 秒里字幕区全空、
+  // 右边又写着「0 段 · 0 词」，看上去就像根本没录上 —— 她会以为坏了然后去乱点。
+  // 所以明确告诉她在等什么、还要等多久。
+  if (engine === 'whisper') showWaiting();
   $('#btnPause').textContent = '⏸ 暂停';
   setStatus('rec', '录音中');
 
   if (st.audioBackup) mic.recordStart();
   if (st.wakeLock && !st.powerSaver) keepAwake().then(w => S.wake = w);
+  // navigator.wakeLock 只在页面可见时有效：她切到 Word 记笔记、或者窗口被别的 App 盖住，
+  // 锁就被释放了，Mac 照样休眠 → 录音和 Whisper 一起停，而计时器还在走（用 Date.now 算的），
+  // 她回来只会看到「中间那段字怎么没了」。桌面版必须用主进程的 powerSaveBlocker。
+  if (IS_DESKTOP && window.VCDesktop.setPreventSleep) {
+    window.VCDesktop.setPreventSleep(true).catch(() => {});
+  }
 
   // ---- 本地 Whisper ----
   if (engine === 'whisper' || engine === 'hybrid') {
@@ -399,10 +574,42 @@ async function startRecording() {
   document.addEventListener('visibilitychange', onVisible);
 }
 
+// 浏览器识别会把一句话切成「pre」「chapter section」这种碎片，
+// 每个碎片单独成段、单独翻译，中文就变成「前」「章节」这种废话。
+// 所以先攒起来，凑成一个完整句子再落段。
+const FRAG = {
+  parts: [], t0: null, timer: null,
+  push(text) {
+    if (!text) return;
+    if (this.t0 == null) this.t0 = elapsed();
+    this.parts.push(text);
+    S.lastHeard = Date.now();
+    if (S._quietWarned) { S._quietWarned = false; $('#warnBox').hidden = true; }
+    clearTimeout(this.timer);
+    const joined = this.parts.join(' ');
+    const n = words(joined);
+    const ended = /[.!?。！？][”"')\]]?\s*$/.test(joined);
+    // 句子说完了、或者已经攒够一句的长度 → 立刻落段
+    if ((ended && n >= 5) || n >= 24) return this.flush();
+    // 否则等 2.2 秒；老师停顿了就当一句结束
+    this.timer = setTimeout(() => this.flush(), 2200);
+  },
+  flush() {
+    clearTimeout(this.timer);
+    this.timer = null;
+    if (!this.parts.length) return;
+    const text = this.parts.join(' ').replace(/\s+/g, ' ').trim();
+    const t = this.t0;
+    this.parts = []; this.t0 = null;
+    if (text) addSegment({ text, kind: 'speech', t });
+  },
+  reset() { clearTimeout(this.timer); this.timer = null; this.parts = []; this.t0 = null; }
+};
+
 function startWebSpeech(st) {
   S.asr = new ASR({
       lang: st.srcLang,
-      onFinal: (text) => addSegment({ text, kind: 'speech' }),
+      onFinal: (text) => FRAG.push(text),
       onInterim: (t) => { $('#interim').textContent = t ? '…' + t : ''; },
       onStatus: (s) => {
         if (S.paused) return;
@@ -449,7 +656,15 @@ function onVisible() {
   if (S.cur && !S.paused && _st.wakeLock && !_st.powerSaver && !S.wake) keepAwake().then(w => S.wake = w);
   pumpTranslate();
 }
-function beforeUnload(e) { if (S.cur) { e.preventDefault(); e.returnValue = '正在录制中，真的要离开吗？'; } }
+// ⚠️ 桌面版一定要直接 return。
+// Electron 不会像浏览器那样弹「确定离开吗」——它只是把关窗**静默取消**掉：
+// 点红叉 / Cmd+Q 完全没反应，她会以为 App 死机去强制退出，
+// 而那时整节课的录音还只在内存里（要 stopRecording 才写进 IndexedDB）= 全丢。
+// 桌面版改走 VCDesktop.onBeforeQuit，主进程会弹一个真的有「继续录制 / 仍然退出」的对话框。
+function beforeUnload(e) {
+  if (IS_DESKTOP) return;
+  if (S.cur) { e.preventDefault(); e.returnValue = '正在录制中，真的要离开吗？'; }
+}
 
 function setStatus(cls, text) {
   const p = $('#statusPill');
@@ -466,12 +681,43 @@ function tick() {
     const quiet = Date.now() - (S.lastHeard || S.t0);
     if (quiet > 90000 && !S._quietWarned) {
       S._quietWarned = true;
-      showWarn('已经 90 秒没有识别到任何文字。请确认：① 老师在讲话；② 右上角音量条在动；③ 系统默认输入设备是你想用的那个麦克风。录音备份仍在继续，下课后可以重听。');
+      showWarn('已经 90 秒没有识别到任何文字。先看右上角音量条：在动=声音收到了，' +
+        '多半只是老师停下来了，不用管。完全不动的话，点「⏸ 暂停」→ 回到上一页换一个麦克风→再「继续」。' +
+        '⚠️ 不要结束这节课 —— 录音一直在存，下课后可以整节重新转写，一个字都不会丢。');
     }
   }
   const n = S.cur ? S.cur.segments.filter(s => s.kind === 'speech').length : 0;
   const w = S.cur ? S.cur.segments.reduce((a, s) => a + words(s.text), 0) : 0;
   $('#liveStats').textContent = `${n} 段 · ${w} 词`;
+  tickWaiting();
+}
+
+/* 纯 Whisper 模式下「还没出第一段字」时的等待提示。
+   Whisper 攒满一个 25 秒的窗口才吐一次，中间完全没有输出，
+   不说清楚的话她只会看到一片空白 + 0 段 0 词。 */
+const WHISPER_FIRST_MS = 26000;
+function showWaiting() {
+  const box = $('#liveTranscript');
+  if (!box || box.querySelector('.waiting')) return;
+  // 已经有字了就别再摆「正在听」—— 恢复未完成的课、或者识别抢先出结果时会碰到
+  if (S.cur && S.cur.segments.some(x => x.kind === 'speech')) return;
+  box.innerHTML = `<div class="waiting">
+    <div class="waiting-dots"><i></i><i></i><i></i></div>
+    <p class="waiting-main">正在听老师讲话…</p>
+    <p class="waiting-sub">本地识别是攒满一段再翻译，<b>第一段大约 25 秒</b>后出现。<br>
+       这段时间是正常的，<b>不用点任何东西</b>。右上角音量条在动就说明收到声音了。</p>
+    <p class="waiting-count" id="waitCount"></p>
+  </div>`;
+}
+function tickWaiting() {
+  const el = $('#waitCount');
+  if (!el || !S.cur || S.paused) return;
+  const left = Math.ceil((WHISPER_FIRST_MS - elapsed()) / 1000);
+  el.textContent = left > 0 ? `第一段字大约还有 ${left} 秒` : '快出来了…';
+}
+function clearWaiting() {
+  const w = $('#liveTranscript') && $('#liveTranscript').querySelector('.waiting');
+  if (w) w.remove();
 }
 // 省电：音量表不用 60fps 的 requestAnimationFrame，8fps 足够看，页面切走时完全停掉
 function meterLoop() {
@@ -498,6 +744,7 @@ function addSegment({ text, kind = 'speech', src = 'live', t = null }) {
     S.lastHeard = Date.now();
     if (S._quietWarned) { S._quietWarned = false; $('#warnBox').hidden = true; }
   }
+  clearWaiting();
   renderSeg(seg, $('#liveTranscript'), true);
   persist();
   const st = settings();
@@ -507,7 +754,12 @@ function addSegment({ text, kind = 'speech', src = 'live', t = null }) {
 function renderSeg(seg, host, autoscroll) {
   const near = host.scrollHeight - host.scrollTop - host.clientHeight < 120;
   const div = document.createElement('div');
-  div.className = 'seg' + (seg.kind === 'mark' ? ' mark' : seg.kind === 'note' ? ' note' : '');
+  // 老师在强调的句子用颜色标出来，上课时扫一眼就知道哪句必须抓住
+  let emph = '';
+  if (seg.kind === 'speech' && COACH_EMPH) {
+    try { const lv = COACH_EMPH(seg.text); if (lv) emph = ' emph' + lv; } catch (_) {}
+  }
+  div.className = 'seg' + (seg.kind === 'mark' ? ' mark' : seg.kind === 'note' ? ' note' : emph);
   div.dataset.id = seg.id;
   const badge = seg.zhFrom === 'mt' ? ' <i class="who" title="opus-mt 胜出">MT</i>'
     : seg.zhFrom === 'llm' ? ' <i class="who llm" title="本地大模型胜出">AI</i>' : '';
@@ -624,6 +876,9 @@ async function stopRecording() {
   FRAG.flush();
   S.asr && S.asr.stop();
   try { S.wake && S.wake.release(); } catch (_) {} S.wake = null;
+  if (IS_DESKTOP && window.VCDesktop.setPreventSleep) {
+    window.VCDesktop.setPreventSleep(false).catch(() => {});
+  }
 
   cur.endedAt = Date.now();
   cur.durationMs = elapsed();
@@ -767,7 +1022,10 @@ async function openSession(id) {
                 useLocalLLM: st0.useLocalLLM, llmModel: st0.llmModel };
   S.detailCtx = ctx;
   $('#sTitle').textContent = s.title;
-  $('#sMeta').textContent = `${ctx.course} · ${ctx.teacher} · ${dateCN(s.startedAt)} · 时长 ${mmss(s.durationMs || 0)} · ${s.segments.filter(x => x.kind === 'speech').length} 段`;
+  $('#sMeta').textContent = [ctx.course, ctx.teacher, dateCN(s.startedAt), '时长 ' + mmss(s.durationMs || 0),
+    s.segments.filter(x => x.kind === 'speech').length + ' 段'].filter(Boolean).join(' · ');
+  const miss = !s.teacherId && !s.courseId;
+  $('#sMetaMiss').hidden = !miss;
   $('#pane-sum').innerHTML = md2html(s.summary || '（还没有概要，点上面的「重新生成概要」）');
   const host = $('#fullBody'); host.innerHTML = '';
   s.segments.forEach(seg => renderSeg(seg, host, false));
@@ -778,6 +1036,7 @@ async function openSession(id) {
   showPane(s.segments.length ? 'sum' : 'notes');
 
   setupPlayer(s).catch(e => console.warn('[VC] 播放器初始化失败', e));
+  renderCoach(s).catch(e => console.warn('[VC] 回听清单生成失败', e));
 
   const a = $('#player');
   if (s.hasAudio) {
@@ -788,7 +1047,7 @@ async function openSession(id) {
     }
   } else { a.removeAttribute('src'); $('#audioMsg').textContent = '这节课没有保存录音。'; }
 }
-const PANES = ['sum', 'full', 'notes', 'study', 'audio'];
+const PANES = ['sum', 'full', 'coach', 'notes', 'study', 'audio'];
 function showPane(p) {
   $$('.stab').forEach(b => b.classList.toggle('active', b.dataset.pane === p));
   PANES.forEach(x => { const el = $('#pane-' + x); if (el) el.hidden = x !== p; });
@@ -826,17 +1085,38 @@ async function retranslate() {
   toast('翻译完成');
 }
 
+// 快速开始录的课下课后在这里补信息。老师/学科可以从已有的里选，也可以直接打一个新名字
+// （自动建好），空着就是不填。以前这里是下拉框，只能选已有的 —— 快速开始之后没法补新老师。
 async function renameSession() {
   const s = S.detail; if (!s) return;
   const r = await dialog('修改信息', [
     { name: 'title', label: '标题', value: s.title },
-    { name: 'teacherId', label: '老师', type: 'select', value: s.teacherId, options: S.teachers.map(t => ({ v: t.id, t: t.name })) },
-    { name: 'courseId', label: '学科', type: 'select', value: s.courseId, options: S.courses.map(c => ({ v: c.id, t: c.name })) }
+    { name: 'teacher', label: '老师（选已有的，或直接打新名字；空着=不填）', type: 'combo',
+      value: nameOf(S.teachers, s.teacherId), placeholder: '例如：Prof. Smith', options: S.teachers.map(t => t.name) },
+    { name: 'course', label: '学科', type: 'combo',
+      value: nameOf(S.courses, s.courseId), placeholder: '例如：ECON 101', options: S.courses.map(c => c.name) }
   ]);
   if (!r) return;
-  Object.assign(s, { title: r.title || s.title, teacherId: r.teacherId, courseId: r.courseId });
+  s.title = r.title || s.title;
+  s.teacherId = await entityByName('teachers', r.teacher);
+  s.courseId = await entityByName('courses', r.course);
   await db.put('sessions', s);
+  await loadLists();
   openSession(s.id);
+  toast('已保存');
+}
+
+// 按名字找老师/学科，没有就新建；空名字 = 不填
+async function entityByName(store, name) {
+  const n = String(name || '').trim();
+  if (!n) return '';
+  const list = store === 'teachers' ? S.teachers : S.courses;
+  const hit = list.find(x => String(x.name || '').trim().toLowerCase() === n.toLowerCase());
+  if (hit) return hit.id;
+  const item = { id: uid(), name: n, createdAt: Date.now() };
+  await db.put(store, item);
+  list.push(item);
+  return item.id;
 }
 
 async function removeSession(id) {
@@ -1173,6 +1453,47 @@ async function testMtQuality() {
   }
 }
 
+/* ============================== 回听清单（语速 + 该重听哪几句） ============================== */
+async function renderCoach(session) {
+  const box = $('#paceCard'), recap = $('#recapList'), miss = $('#missList');
+  if (!box) return;
+  let C;
+  try { C = await mod('coach'); }
+  catch (e) { box.innerHTML = `<p class="muted">听力分析模块没加载出来：${esc(e.message)}</p>`; return; }
+
+  // 语速卡片
+  try {
+    const p = C.paceStats(session);
+    const cls = { slow: 'pace-slow', normal: 'pace-normal', fast: 'pace-fast', 'very-fast': 'pace-veryfast' }[p.level] || 'pace-normal';
+    const label = { slow: '偏慢', normal: '正常', fast: '偏快', 'very-fast': '非常快' }[p.level] || '';
+    box.innerHTML = `<div><span class="big">${p.wpm}<span class="unit">词/分钟</span></span>
+      <span class="tag ${cls}">${label}</span></div><p>${esc(p.comment || '')}</p>`;
+  } catch (e) { box.innerHTML = `<p class="muted">语速统计失败：${esc(e.message)}</p>`; }
+
+  const row = (x, kind) => {
+    const sev = x.severity ? ` sev-${x.severity}` : '';
+    const why = (x.reasons && x.reasons.length) ? x.reasons.join('；') : (x.why || '');
+    return `<div class="miss-item${sev}">
+      <div class="hd"><button data-goplay="${esc(x.segId || x.id || '')}" title="听这一句的原声">▶</button>
+        <span>[${mmss(x.t || 0)}]</span>${kind === 'recap' ? '' : `<span>${x.severity === 'high' ? '最该回听' : x.severity === 'mid' ? '建议回听' : '可以看看'}</span>`}</div>
+      <div class="en">${esc(x.text || '')}</div>
+      ${x.zh ? `<div class="zh">${esc(x.zh)}</div>` : ''}
+      ${why ? `<div class="why">${esc(why)}</div>` : ''}</div>`;
+  };
+
+  try {
+    const r = C.threeMinuteRecap(session);
+    recap.innerHTML = (r.items || []).length ? r.items.map(x => row(x, 'recap')).join('')
+      : '<p class="muted">这节课太短，没什么可速览的。</p>';
+  } catch (e) { recap.innerHTML = `<p class="muted">速览生成失败：${esc(e.message)}</p>`; }
+
+  try {
+    const m = C.findMissed(session, { limit: 15 });
+    miss.innerHTML = (m || []).length ? m.map(x => row(x, 'miss')).join('')
+      : '<p class="muted">没发现明显跟不上的地方 —— 这节课的语速对你应该不成问题。</p>';
+  } catch (e) { miss.innerHTML = `<p class="muted">分析失败：${esc(e.message)}</p>`; }
+}
+
 /* ============================== 原声回放 + 跟读 ============================== */
 // 适应语速唯一有效的练习：反复听真实语速的原声，再对着它复述。
 // 读讲稿不会让耳朵变快。
@@ -1185,7 +1506,14 @@ async function setupPlayer(session) {
   if (!session.hasAudio) { bar.hidden = true; if (PL) { PL.destroy(); PL = null; } return; }
 
   const rec = await db.get('audio', session.id);
-  if (!rec || !rec.blob) { bar.hidden = true; return; }
+  if (!rec || !rec.blob || !rec.blob.size) {
+    // 标着有录音却读不出来（导入的包不完整、存的时候出错、被清理过…）
+    // 一定要明说，否则用户只会看到「点了没反应」。
+    bar.hidden = false;
+    bar.innerHTML = '<span class="muted">⚠️ 这节课标记了有录音，但录音文件读不出来（可能导入时不完整，或被「清理录音」删过）。文字内容不受影响。</span>';
+    if (PL) { PL.destroy(); PL = null; }
+    return;
+  }
 
   if (PL) PL.destroy();
   PL = new P.SegmentPlayer($('#player'), {
@@ -1282,6 +1610,22 @@ function bindPlayerUI() {
   on('#pbNext', 'click', () => { if (PL) PL.step(1); });
   on('#pbRate', 'change', (e) => { if (PL) PL.setRate(Number(e.target.value)); });
   on('#pbLoop', 'change', (e) => { if (PL) PL.setLoop(e.target.checked ? 3 : 0); });
+
+  // 回听清单里的 ▶：切到讲稿、滚过去、播放那一句
+  on('#pane-coach', 'click', (e) => {
+    const b = e.target.closest('[data-goplay]');
+    if (!b) return;
+    const id = b.dataset.goplay;
+    if (!id) return;
+    showPane('full');
+    setTimeout(() => {
+      const el = $(`#fullBody .seg[data-id="${id}"]`);
+      if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      const r = segRange(id);
+      if (PL && PL.ready && r) PL.play(id, r.start, r.end);
+      else toast(PL ? '录音还在读取中，稍等一下再点' : '这节课没有可播放的录音，只能看文字', 4000);
+    }, 120);
+  });
 
   // 句子上的三个按钮（事件委托，段落是动态渲染的）
   on('#fullBody', 'click', (e) => {
@@ -1712,7 +2056,7 @@ async function semesterDoc() {
   const E = await mod('export');
   const ordered = [...list].sort((a, b) => a.startedAt - b.startedAt);
   const title = `${course || '全部学科'}${teacher ? ' · ' + teacher : ''} 整学期讲稿`;
-  let body = `<h1>${esc(title)}</h1><p style="color:#666">共 ${ordered.length} 节课 · ${dateCN(ordered[0].startedAt)} 至 ${dateCN(ordered[ordered.length - 1].startedAt)} · VoiceCollector · 晗晗专属</p>`;
+  let body = `<h1>${esc(title)}</h1><p style="color:#666">共 ${ordered.length} 节课 · ${dateCN(ordered[0].startedAt)} 至 ${dateCN(ordered[ordered.length - 1].startedAt)} · VoiceCollector</p>`;
   body += '<h2>目录</h2><ol>' + ordered.map(s => `<li>${esc(s.title)}（${dateCN(s.startedAt)}）</li>`).join('') + '</ol>';
   for (const s of ordered) {
     body += `<div style="page-break-before:always"></div><h1>${esc(s.title)}</h1>`;
@@ -1910,6 +2254,13 @@ function bindSettings() {
     useLocalLLM: $('#setLLM').checked,
     llmModel: $('#selLLM').value || ''
   });
+  // 切「大教室模式」时，没手动选过模型的话要让下拉框跟着变（base ⇄ small）
+  $('#setFar').addEventListener('change', () => {
+    const sel = $('#selWModel');
+    if (sel && sel.dataset.filled && !settings().whisperModel) {
+      sel.value = $('#setFar').checked ? 'onnx-community/whisper-small' : 'onnx-community/whisper-base';
+    }
+  });
   ['#setProvider', '#setKey', '#setBase', '#setModel', '#setAudioBackup', '#setCloudASR',
    '#setAGC', '#setNS', '#setLiveTrans', '#setWake', '#setFar', '#setKeepChunks', '#setLLM', '#selLLM', '#setPower', '#setAutoPerfect', '#setAutoBackup'].forEach(sel => {
     $(sel).addEventListener('change', () => { put(); renderDiag(); renderEngineUI(); });
@@ -1921,7 +2272,9 @@ function bindSettings() {
   });
   $('#setPower').addEventListener('change', () => {
     if ($('#setPower').checked && $('#setFar').checked) {
-      toast('注意：大教室模式下开省电，会关掉 Whisper，远距离准确率会明显下降', 6000);
+      toast(IS_DESKTOP
+      ? '省电模式已开：音量表和翻译放慢，识别照常跑，准确率不受影响'
+      : '注意：大教室模式下开省电，会关掉 Whisper，远距离准确率会明显下降', 6000);
     }
   });
   $('#setFar').addEventListener('change', () => {
@@ -1998,7 +2351,17 @@ async function recoverUnfinished() {
 /* ============================== 引擎与模型界面 ============================== */
 async function renderEngineUI() {
   const st = settings();
+  // 桌面版里「浏览器实时识别」和「双引擎」根本跑不起来（asr.js 顶部有原因），
+  // 留在下拉框里只会让人选了之后奇怪为什么没反应，所以直接摘掉。
+  if (IS_DESKTOP) {
+    $$('#selEngine option').forEach(o => {
+      if (o.value === 'webspeech' || o.value === 'hybrid') o.remove();
+    });
+    const autoOpt = $('#selEngine').querySelector('option[value="auto"]');
+    if (autoOpt) autoOpt.textContent = '自动 — 本地 Whisper（推荐）';
+  }
   $('#selEngine').value = st.engine || 'auto';
+  if (!$('#selEngine').value) $('#selEngine').value = 'auto';   // 存档里是已摘掉的选项
   const eff = resolveEngine();
   const info = $('#engineInfo');
   const usesWhisper = eff === 'whisper' || eff === 'hybrid';
@@ -2019,7 +2382,11 @@ async function renderEngineUI() {
       sel.dataset.filled = '1';
       const localDefault = st.farMode ? 'onnx-community/whisper-small' : 'onnx-community/whisper-base';
       sel.value = st.whisperModel || localDefault;
-      if (!st.whisperModel) saveSettings({ whisperModel: sel.value });
+      // ⚠️ 这里以前会 saveSettings({whisperModel: sel.value})。
+      // 第一次打开 App 时 farMode 还是关的，于是 whisper-base 被写死进设置，
+      // 之后 startRecording 里的 `st.whisperModel || LOCAL_DEFAULT` 永远走前半段，
+      // 她再打开「大教室模式」也换不成 small —— 开了等于没开。
+      // 所以不存：没存过就跟着 farMode 走，她自己在下拉框里选过才存（见 #selWModel.onchange）。
       info.innerHTML += `<br>加速方式：<b>${p.webgpu ? 'WebGPU（快、省电）' : 'CPU / WASM（慢一些，建议选小模型）'}</b>　识别跑在独立线程里，卡住也不会影响录音。`;
     } catch (e) {
       sel.innerHTML = '<option value="">（Whisper 模块未就绪）</option>';
@@ -2102,18 +2469,27 @@ async function clearModels() {
 async function init() {
   if (location.protocol === 'file:') { $('#fileWarn').hidden = false; return; }
 
+  // 先把旧端口数据库里的东西收回来（桌面版以前每次启动端口都不一样，见 migrate-import.js）。
+  // 必须在第一次 settings() 之前：settings() 有缓存，晚了采用的旧设置就不生效。
+  // 出任何错都不能挡住 App 启动。
+  if (IS_DESKTOP) {
+    try {
+      const M = await mod('migrate-import');
+      const got = await M.importMigration();
+      if (got && (got.sessions || got.teachers || got.courses)) {
+        setTimeout(() => toast(`已找回以前的记录：${got.sessions} 节课、${got.teachers} 位老师、${got.courses} 门学科`, 6000), 800);
+      }
+    } catch (e) { console.warn('[迁移] 跳过：', e && e.message); }
+  }
+
   $('#selSrcLang').innerHTML = LANGS.map(([v, t]) => `<option value="${v}">${t}</option>`).join('');
   const st = settings();
   $('#selSrcLang').value = st.srcLang;
   $('#selDstLang').value = st.dstLang;
 
+  // 以前第一次打开会自动塞一个「未命名老师 / 未命名学科」，因为那时不选就不让录。
+  // 现在老师和学科都是可选的，不需要了 —— 而且以前每换一次端口就塞一对，她那里攒了 21 个。
   await loadLists();
-  if (!S.teachers.length && !S.courses.length) {
-    // 第一次使用：给点默认值，免得空着不知道怎么开始
-    await db.put('teachers', { id: uid(), name: '未命名老师', createdAt: Date.now() });
-    await db.put('courses', { id: uid(), name: '未命名学科', createdAt: Date.now() });
-    await loadLists();
-  }
   S.sessions = await db.sessionsSorted();
   await recoverUnfinished();
 
@@ -2130,9 +2506,20 @@ async function init() {
   try {
   $$('.tab').forEach(b => b.onclick = () => go(b.dataset.go));
   $$('[data-go]').forEach(b => b.onclick = () => go(b.dataset.go));
+  // 藏起来的那一页：连点左上角图标 5 下（3 秒内）才出来。
+  // 她不用一打开 App 就看见「专属」两个字有压力，但想看随时点得开。
+  bindDedication();
+  bindUpdater();
+  // 录制中点红叉 / Cmd+Q，让主进程弹「继续录制 / 仍然退出」，而不是无声无息什么都不发生
+  if (IS_DESKTOP && window.VCDesktop.onBeforeQuit) {
+    window.VCDesktop.onBeforeQuit(() => S.cur
+      ? '「' + (S.cur.title || '这节课') + '」正在录制中，现在退出会丢掉还没保存的录音。'
+      : true);
+  }
   $('#btnAddTeacher').onclick = () => addEntity('teachers', '老师');
   $('#btnAddCourse').onclick = () => addEntity('courses', '学科');
   $('#btnStart').onclick = () => startRecording().catch(e => toast('启动失败：' + e.message));
+  $('#btnQuick').onclick = () => startRecording({ quick: true }).catch(e => toast('启动失败：' + e.message));
   $('#btnMicTest').onclick = micTest;
   $('#btnPause').onclick = togglePause;
   $('#btnMark').onclick = markPoint;
@@ -2216,12 +2603,15 @@ async function init() {
   $('#btnRedoLocal').onclick = () => redoLocal().catch(e => toast('重新识别失败：' + e.message));
   $('#btnRetranscribe').onclick = () => retranscribe().catch(e => toast('转写失败：' + e.message));
   $('#btnRename').onclick = renameSession;
+  $('#btnFillMeta').onclick = renameSession;
   $('#btnDelete').onclick = deleteSession;
   } catch (e) {
     // 有元素没找到之类的问题，只报警不中断 —— 否则后面所有按钮都绑不上
     console.error('[VC] 绑定事件时出错：', e);
     toast('界面初始化有一处出错（' + e.message + '），大部分功能仍可用', 6000);
   }
+  mod('coach').then(C => { COACH_EMPH = C.emphasisLevel; }).catch(e => console.warn('[VC] 强调上色不可用：', e.message));
+  try { bindPlayerUI(); } catch (e) { console.error('[VC] 播放器绑定出错：', e); }
   try { bindSettings(); } catch (e) { console.error('[VC] 设置页绑定出错：', e); }
   renderDiag();
   renderEngineUI();
@@ -2236,7 +2626,8 @@ async function init() {
     caches.keys().then(ks => ks.forEach(k => { if (k.startsWith('vc-')) caches.delete(k); })).catch(() => {});
   }
   window.VC = { S, db, T, summarize, settings, _test: { addSegment, stopRecording, startRecording, perfectPass,
-    setHQ: (e) => { hqMT = e; T.setHighQualityEngine(e); } } };   // 方便排查问题
+    setHQ: (e) => { hqMT = e; T.setHighQualityEngine(e); },
+    get player() { return PL; }, segRange, shadowPractice } };   // 方便排查问题
 }
 
 init();

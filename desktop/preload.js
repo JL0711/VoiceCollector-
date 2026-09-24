@@ -142,6 +142,33 @@ const VCDesktop = {
    */
   showInFolder(filePath) {
     return ipcRenderer.invoke('vc:show-in-folder', String(filePath || ''));
+  },
+
+  /**
+   * 更新（只换网页层，约 1MB；见 desktop/lib/updater.js）。
+   * 流程：checkUpdate() → 有新版就提示 → 用户点了才 installUpdate() → relaunchForUpdate()。
+   */
+  /** 旧端口数据迁移：界面启动时取一次，合并完报账（见 main.js migrateOrigins） */
+  migration: {
+    take: () => ipcRenderer.invoke('vc:migration-take'),
+    done: ok => ipcRenderer.invoke('vc:migration-done', !!ok)
+  },
+
+  update: {
+    state:    () => ipcRenderer.invoke('vc:update-state'),
+    check:    () => ipcRenderer.invoke('vc:update-check'),
+    install:  () => ipcRenderer.invoke('vc:update-install'),
+    relaunch: () => ipcRenderer.invoke('vc:update-relaunch'),
+    revert:   () => ipcRenderer.invoke('vc:update-revert'),
+    openPage: url => ipcRenderer.invoke('vc:open-release', String(url || '')),
+    /** 界面 init() 成功后调一次，证明这个版本能正常起来（否则下次启动会自动退回） */
+    bootOk:   () => ipcRenderer.invoke('vc:boot-ok'),
+    onProgress(cb) {
+      if (typeof cb !== 'function') return () => {};
+      const h = (e, p) => { try { cb(p); } catch (_) {} };
+      ipcRenderer.on('vc:update-progress', h);
+      return () => ipcRenderer.removeListener('vc:update-progress', h);
+    }
   }
 };
 
