@@ -29,6 +29,9 @@ const ROUNDS = parseInt(opt('--rounds') || '4', 10);
 const ONLY = (opt('--only') || '').split(',').filter(Boolean);
 const TMP = mkdtempSync(join(tmpdir(), 'vc-rehearse-'));
 const ELECTRON = join(DESKTOP, 'node_modules', '.bin', 'electron');
+// 更新场景用的版本号按 App 自带的版本往上加，别写死（写死过 1.0.2，结果 App 自己升到 1.0.2 后测试就失效了）
+const BUNDLED = JSON.parse(readFileSync(join(DESKTOP, '..', 'web', 'version.json'), 'utf8')).version;
+const bump = n => BUNDLED.split('.').map((x, i, a) => i === a.length - 1 ? String(+x + n) : x).join('.');
 
 let seq = 0;
 const newProfile = () => { const d = join(TMP, 'p' + (++seq)); return d; };
@@ -43,7 +46,8 @@ function launch(profile, env = {}) {
     let out = '';
     p.stdout.on('data', d => { out += d; });
     p.stderr.on('data', d => { out += d; });
-    const kill = setTimeout(() => { try { p.kill('SIGKILL'); } catch (_) {} }, 170000);
+    // 硬超时比 App 自己的看门狗（VC_SMOKE_TIMEOUT，默认 120 秒）多留 50 秒
+    const kill = setTimeout(() => { try { p.kill('SIGKILL'); } catch (_) {} }, ((Number(env.VC_SMOKE_TIMEOUT) || 120) + 50) * 1000);
     p.on('close', () => {
       clearTimeout(kill);
       const m = out.match(/===VC_SMOKE_BEGIN===\s*([\s\S]*?)\s*===VC_SMOKE_END===/);
@@ -86,8 +90,43 @@ const SCENARIOS = {
     for (let i = 1; i <= ROUNDS; i++) {
       const j = await launch(newProfile(), { VC_SMOKE_FLOW: 'quick' });
       const r = R(j);
-      const ok = j.ok && r.engine === 'whisper' && /whisper-base/.test(r.wmodel || '') && r.filled;
+      // 2026-10-06 起统一用 small（有 WebGPU 的机器；这台 Mac 有）
+      const ok = j.ok && r.engine === 'whisper' && /whisper-small/.test(r.wmodel || '') && r.filled;
       record('quick', `快速开始 #${i}`, ok, why(j), j._ms);
+    }
+  },
+
+  // 导入录音：她第一次真实测试用的是 iPhone 录的 m4a。测试音频用 say 直接生成到文件（不会从扬声器出声）
+  async import() {
+    const aiff = join(TMP, 'lecture.aiff'), m4a = join(TMP, 'lecture-test.m4a');
+    const words = 'Good morning everyone. Today we are going to talk about modern art and the industrial revolution. ' +
+      'Photography changes the way painters think about images. Collage brings everyday life and art closer together. ' +
+      'Your midterm essay is due next Friday, so please start early.';
+    execFileSync('say', ['-o', aiff, words]);
+    execFileSync('afconvert', ['-f', 'm4af', '-d', 'aac', aiff, m4a]);
+    for (let i = 1; i <= Math.max(2, Math.ceil(ROUNDS / 2)); i++) {
+      const j = await launch(newProfile(), { VC_SMOKE_FLOW: 'quick', VC_SMOKE_IMPORT: m4a });
+      const im = R(j).import || {};
+      const ok = j.ok && im.ok && im.segs >= 2 && /modern art/i.test(im.text || '') && im.zh > 0 && im.summary && im.audio && im.archived
+        && im.lastT > im.firstT;
+      record('import', `导入一段 m4a 录音 #${i}`, ok,
+        JSON.stringify({ segs: im.segs, model: im.model, zh: im.zh, summary: im.summary, audio: im.audio, archived: im.archived, t: [im.firstT, im.lastT], err: im.error || im.archiveError }) + (j.ok ? '' : ' ' + why(j)), j._ms);
+    }
+  },
+
+  // 首页「📂 上传录音，直接识别」+ 把文件拖进窗口：都要能导入，导完自动打开那节课
+  async upload() {
+    const aiff = join(TMP, 'upload.aiff'), m4a = join(TMP, 'upload-test.m4a');
+    execFileSync('say', ['-o', aiff, 'Good morning. Today we talk about the Battle of Brandywine and the American Revolution. ' +
+      'Please read chapter five before next class.']);
+    execFileSync('afconvert', ['-f', 'm4af', '-d', 'aac', aiff, m4a]);
+    for (let i = 1; i <= Math.max(1, Math.ceil(ROUNDS / 3)); i++) {
+      const j = await launch(newProfile(), { VC_SMOKE_FLOW: 'quick', VC_SMOKE_UPLOAD: m4a, VC_SMOKE_TIMEOUT: '360' });
+      const u = R(j).upload || {};
+      const ok = j.ok && u.homeButtonVisible && u.opensPicker && u.homeProgressShown && u.buttonImported && u.buttonOpenedSession &&
+        /brandywine/i.test(u.buttonText || '') && u.dropHintShown && u.dragoverPrevented && u.dropPrevented && u.dropHintHidden &&
+        u.dropImported && u.dropOpenedSession && u.nonAudioIgnored && /不是录音/.test(u.nonAudioToast || '');
+      record('upload', `首页上传按钮 + 拖进窗口 #${i}`, ok, JSON.stringify(u) + (j.ok ? '' : ' ' + why(j)), j._ms);
     }
   },
 
@@ -176,7 +215,7 @@ const SCENARIOS = {
 
   // 更新：假 GitHub → 检查 → 下载安装 → 重开是新版本、数据还在
   async update() {
-    const pkg = buildUpdate('1.0.2', false);
+    const pkg = buildUpdate(bump(1), false);
     const gh = await fakeGitHub(pkg);
     const prof = newProfile();
     const env = { VC_TEST_UPDATE: '1', VC_UPDATE_API: gh.url };
@@ -186,18 +225,18 @@ const SCENARIOS = {
       JSON.stringify({ check: r1.updCheck && (r1.updCheck.reason || r1.updCheck.version), install: r1.updInstall }), j1._ms);
     const j2 = await launch(prof, { ...env, VC_SMOKE_FLOW: 'quick' });
     const r2 = R(j2);
-    record('update', `重开后用的是新版本 1.0.2`, j2.ok && r2.updState && r2.updState.current === '1.0.2' && r2.updState.usingUpdate,
+    record('update', `重开后用的是新版本 ${bump(1)}`, j2.ok && r2.updState && r2.updState.current === bump(1) && r2.updState.usingUpdate,
       JSON.stringify(r2.updState) + ' ' + (j2.ok ? '' : why(j2)), j2._ms);
     record('update', `更新之后数据还在`, C(j2).sessions === 1, `看到 ${C(j2).sessions} 节课（应该 1）`);
     const j3 = await launch(prof, { ...env, VC_SMOKE_FLOW: 'full' });
-    record('update', `再开一次仍是新版本（不会被误退回）`, j3.ok && R(j3).updState && R(j3).updState.current === '1.0.2',
+    record('update', `再开一次仍是新版本（不会被误退回）`, j3.ok && R(j3).updState && R(j3).updState.current === bump(1),
       JSON.stringify(R(j3).updState), j3._ms);
     gh.close();
   },
 
   // 坏更新：新版本一打开就崩 → 下一次打开自动退回 App 自带的版本
   async badupdate() {
-    const pkg = buildUpdate('1.0.3', true);
+    const pkg = buildUpdate(bump(2), true);
     const gh = await fakeGitHub(pkg);
     const prof = newProfile();
     const env = { VC_TEST_UPDATE: '1', VC_UPDATE_API: gh.url };
@@ -226,7 +265,7 @@ const SCENARIOS = {
     record('updnone', `还没发布过版本：显示「已是最新」而不是「失败」`, j0.ok && c0.available === false && !c0.error && !/失败/.test(c0.reason || ''),
       JSON.stringify(c0), j0._ms);
     none.close();
-    const pkg = buildUpdate('1.0.1', false);          // 和内置版本一样
+    const pkg = buildUpdate(BUNDLED, false);          // 和内置版本一样
     const gh = await fakeGitHub(pkg);
     const j2 = await launch(newProfile(), { VC_TEST_UPDATE: '1', VC_UPDATE_API: gh.url, VC_SMOKE_UPDATE: 'install', VC_SMOKE_FLOW: 'quick' });
     record('updnone', `已是最新版：不提示更新`, j2.ok && R(j2).updCheck && R(j2).updCheck.available === false,
@@ -253,7 +292,7 @@ function fakeGitHub(pkg) {
         rsp.writeHead(200, { 'Content-Type': 'application/json' });
         return rsp.end(JSON.stringify({
           tag_name: 'v' + pkg.version, draft: false,
-          html_url: 'https://github.com/MartinMax0711/VoiceCollector-/releases/tag/v' + pkg.version,
+          html_url: 'https://github.com/JL0711/VoiceCollector-/releases/tag/v' + pkg.version,
           body: `- 测试用更新\nsha256: ${pkg.sha256}\n`,
           assets: [{ name: `web-${pkg.version}.zip`, size: pkg.size,
                      browser_download_url: `http://127.0.0.1:${port}/dl/web-${pkg.version}.zip` }]

@@ -1417,6 +1417,72 @@ const FUNC_HEAD = new Set(['越', '又', '更', '再', '很', '一', '不', '没
 const CJK_RE = /[㐀-䶿一-鿿]/;
 const CJK_G = /[㐀-䶿一-鿿]/g;
 
+// 标点打架：句号/问号/感叹号后面紧跟逗号（「。,」「?,」），或逗号后面紧跟句号/逗号（「,,」「,。」）。
+// 正常中文不会这样写，这是 opus-mt 陷进复读循环、把一段段半截话硬拼起来时留下的接缝。
+// 刻意不收「。。」「??」「...」：模型照抄原文的省略号/问号很常见，读起来没问题。
+// 英文句点只在前面不是字母/数字时才算（免得「U.S.,」「2.,」被误算）。
+const PUNCT_CLASH_G = /[。!！?？][,，、]|(?<![A-Za-z0-9])\.[,，、]|[,，、][。!！?？,，、]|[,，、]\.(?!\.)/g;
+
+// 切小句用的分隔符（中英文标点 + 空白）
+const CLAUSE_SPLIT = /[。！？；，、,.!?;…:：\s]+/;
+
+/** 数组里出现次数最多的元素出现了几次 */
+function maxCount(arr) {
+  const m = new Map();
+  let best = 0;
+  for (const x of arr) {
+    const n = (m.get(x) || 0) + 1;
+    m.set(x, n);
+    if (n > best) best = n;
+  }
+  return best;
+}
+
+/**
+ * 原文自己重复了多少次：同一个小句出现几次，或同一个词连着说几次（"no, no, no" / "again again"）
+ * 用来给译文的复读「留额度」—— 原文说了三遍「不」，译文三遍「不」是对的。
+ */
+function enRepeatAllowance(src) {
+  const s = String(src || '').toLowerCase();
+  const clauses = s.split(/[.,!?;:]+/).map(x => x.trim()).filter(Boolean);
+  let best = maxCount(clauses);
+  const ws = enWords(s);
+  let run = 1;
+  for (let i = 1; i < ws.length; i++) {
+    run = ws[i] === ws[i - 1] ? run + 1 : 1;
+    if (run > best) best = run;
+  }
+  return Math.max(1, best);
+}
+
+/** 原文里有没有重复出现的三词短语（口语里说话人自己重说一遍很常见，译文跟着重复是对的） */
+function enHasRepeatedPhrase(src) {
+  const ws = enWords(src).map(w => w.toLowerCase());
+  const seen = new Set();
+  for (let i = 0; i + 3 <= ws.length; i++) {
+    const k = ws[i] + ' ' + ws[i + 1] + ' ' + ws[i + 2];
+    if (seen.has(k)) return true;
+    seen.add(k);
+  }
+  return false;
+}
+
+/**
+ * 不相邻地重复出现的长中文片段（≥6 字），返回第一个找到的片段，没有返回 ''。
+ * 「我们开始做一些新的……我们开始做一些新的东西」这种隔几句又绕回来的复读，
+ * 上面「连续重复」的规则抓不到。
+ */
+function repeatedLongRun(zhOnly) {
+  if (zhOnly.length < 12) return '';
+  for (let L = 6; L <= 12; L++) {
+    for (let i = 0; i + 2 * L <= zhOnly.length; i++) {
+      const piece = zhOnly.slice(i, i + L);
+      if (zhOnly.indexOf(piece, i + L) >= 0) return piece;
+    }
+  }
+  return '';
+}
+
 /**
  * 检测译文是否退化
  * @param {string} zh 译文
@@ -1489,6 +1555,32 @@ export function looksDegenerate(zh, en) {
       return BAD('整句复读');
     }
   }
+
+  // --- 复读循环的拼接痕迹（真实课堂录音里 opus-mt 崩出来的样子）---
+  // 例：「……在工厂里。。。,我们开始做一些新的,,我们做一些东西,比如……,我们开始做一些新的东西,,我们做一些东西,比如, 做」
+  // 单看任何一条都可能是正常口语译文偶尔带的毛病，所以：一条够硬就直接判，否则要两条以上同时出现。
+  const clash = (z.match(PUNCT_CLASH_G) || []).length;
+  if (clash >= 3) return BAD('标点堆叠（疑似复读拼接）');
+
+  // 同一个小句被念了好几遍，原文却没这么说：「你这混蛋,你这混蛋,你这混蛋」「我明白,我明白,我明白,我明白」
+  // （小模型在句尾凭空编出来的复读尾巴，中文比例、长度都正常，前面的规则全放过了）
+  // 只看 3 个字以上的小句：「是的,是的,是的」常常是 yes / yeah / yep 被翻成同一个词，
+  // 一个人连着应三声也很正常；真正的复读尾巴（你这混蛋、我明白）都在 3 个字以上。
+  const zhClauses = raw.split(CLAUSE_SPLIT).filter(c => c && [...c.trim()].length >= 3);
+  const clauseRep = maxCount(zhClauses);
+  if (clauseRep >= 3 && clauseRep > enRepeatAllowance(src) + 1) return BAD('小句复读');
+
+  const signs = [];
+  if (clash) signs.push('标点堆叠');
+  if (clash >= 2) signs.push('标点堆叠×2');
+  // 中文比英文应有的长度长出一大截（正常口语译文大约 1.2~2 个汉字/词）
+  if (w >= 5 && cjk > w * 2.2 + 6) signs.push('偏长');
+  // 结尾半截：长句最后停在「, 做」「,我」这种逗号后孤零零一个字上
+  if (cjk >= 20 && /[,，、][一-鿿]$/.test(z)) signs.push('结尾半截');
+  // 隔开重复的长片段（≥6 字），而原文并没有重复的短语
+  const longRep = repeatedLongRun(zhOnly);
+  if (longRep && !enHasRepeatedPhrase(src)) signs.push('重复片段「' + longRep + '」');
+  if (signs.length >= 2) return BAD('疑似复读拼接：' + signs.join('、'));
 
   // --- 长度异常（拿原文做参照）---
   if (w > 0) {

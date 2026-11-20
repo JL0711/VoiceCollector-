@@ -46,6 +46,12 @@
       <button class="quick-btn" id="btnQuick">⚡ 立即开始录音</button>
       <p class="quick-sub">来不及设置？直接点这个。什么都不用填，下课后再补老师和学科。<br>
         用的是最稳的一套设置，<b>完全离线</b>，网络再差也不影响。</p>
+      <div class="upload">
+        <button class="upload-btn" id="btnUploadHome">📂 上传录音，直接识别</button>
+        <p class="quick-sub">手机、录音笔、微信里存下来的录音都行（m4a / mp3 / wav …），<b>直接把文件拖进这个窗口</b>也可以。<br>
+          识别 → 翻译 → 概要 → 自动存档，一样完全离线。</p>
+        <div class="import-msg" id="importMsgHome" hidden></div>
+      </div>
     </div>
 
     <h2>开始一节新课 <em class="opt">老师、学科都可以不填</em></h2>
@@ -175,12 +181,15 @@
     </div>
     <div class="export-row" style="margin-top:14px">
       <button class="ghost" id="btnNewNote">＋ 新建笔记本（不录音）</button>
+      <button class="primary" id="btnImportAudio">🎧 导入录音（手机录的也行）</button>
+      <input type="file" id="fileAudio" accept="audio/*,video/mp4,.m4a,.mp3,.wav,.aac,.flac,.ogg,.opus,.webm,.caf" multiple hidden>
       <button class="ghost" id="btnImportPack">📥 导入课程包</button>
       <input type="file" id="filePack" accept=".vcpack,application/octet-stream" multiple hidden>
       <button class="primary" id="btnReviewAll">📚 生成总复习（当前筛选的课）</button>
       <button class="ghost" id="btnSemesterDoc">🎓 整学期讲稿合并（Word）</button>
       <button class="ghost" id="btnSemesterPack">📦 整学期打包备份</button>
     </div>
+    <div class="import-msg" id="importMsg" hidden></div>
     <div id="libList" class="lib-list"></div>
   </div>
 </section>
@@ -507,6 +516,7 @@
 </main>
 
 <div id="toast" class="toast" hidden></div>
+<div id="dropHint" class="drop-hint" hidden><div>🎧 松开就开始识别这段录音</div></div>
 
 <dialog id="aiDlg">
   <h3>🤖 打包给 AI 学习</h3>

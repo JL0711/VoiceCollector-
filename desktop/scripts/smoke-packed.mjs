@@ -25,7 +25,13 @@ const CANDIDATES = [
 function runOne(label, bin) {
   return new Promise(res => {
     const profile = mkdtempSync(join(tmpdir(), 'vc-smoke-'));
-    const p = spawn(bin, ['--smoke-test', `--user-data-dir=${profile}`], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let p;
+    try { p = spawn(bin, ['--smoke-test', `--user-data-dir=${profile}`], { stdio: ['ignore', 'pipe', 'pipe'] }); }
+    catch (e) {
+      // -86 = Bad CPU type：Apple 芯片的 Mac 没装 Rosetta 就跑不了 Intel 版，这台机器上测不了，不算失败
+      try { rmSync(profile, { recursive: true, force: true }); } catch (_) {}
+      return res({ label, skipped: e.errno === -86 || /-86/.test(String(e.code)), error: e, raw: '' });
+    }
     let out = '';
     p.stdout.on('data', d => { out += d; });
     p.stderr.on('data', d => { out += d; });
@@ -51,6 +57,8 @@ let bad = 0;
 for (const [label, bin] of found) {
   process.stdout.write(`\n▸ 在打包好的 App 里实测（${label}）…\n`);
   const r = await runOne(label, bin);
+  if (r.skipped) { console.log(`  ⚠️ 跳过：这台 Mac 没装 Rosetta，跑不了 ${label} 版（不是 App 的问题，Intel 版要在别的电脑上测）`); continue; }
+  if (r.error) { console.error(`  ❌ ${label}：启动失败 ${r.error.message}`); bad++; continue; }
   const j = r.json;
   if (!j) {
     console.error(`  ❌ ${label}：App 没有输出冒烟测试结果（退出码 ${r.code}）`);

@@ -20,6 +20,7 @@
 //   buildNotes(analysis, { ctx, translateFn }) -> Promise<Markdown 字符串>
 
 import { mmss } from './util.js';
+import { looksDegenerate } from './glossary.js';
 
 /* ============================== 内置词表 ============================== */
 
@@ -43,8 +44,30 @@ whereas whether which while who whoever whom whose why will with within without 
 youd your yours yourself youre youve
 um uh uhh er erm ah ahh hmm mhm huh gonna wanna gotta kinda sorta alright anyways basically actually literally obviously
 essentially sort kind lot bit stuff guys folks everybody okay yknow
+cuz cos gotcha dunno lemme gimme totally definitely certainly whatnot anyhow
 `.trim().split(/\s+/);
 const STOP = new Set(STOP_WORDS);
+// 口语里的加强词：只在「两词搭配的第一个词」这个位置拦下（super overwhelming、pretty much、really big…）。
+// ⚠️ 不能放进上面的全局停用词：cause（法学 proximate cause、科学 cause and effect）、
+//    less（经济学 less than）、super（心理学 super ego）、pretty（艺术史里讨论「美」）在别的课里是正经词，
+//    放进全局停用词它们就永远当不了术语，还会把真正的固定搭配从中间拆开。
+const INTENSIFIER = new Set('super pretty really very so quite kinda sorta totally like just'.split(' '));
+
+// 真实课堂录音里口语缩写极多（一节 59 分钟的课：it's ×59、I'm ×54、that's ×40、don't ×36…），
+// 而停用词表里写的是去掉撇号的 im / its / thats —— 分词保留了撇号，两边永远对不上，
+// 结果「I'M / It'S」成了整节课的主线和核心术语。这里统一在分词时处理：
+//   · n't / 'm / 're / 've / 'll / 'd —— 全是功能词，整词丢掉
+//   · 's —— 前面是代词/功能词（it's、that's、there's、what's、let's）丢掉；
+//            前面是实词（Picasso's、the artist's）当所有格，去掉 's 留下实词
+function normWord(raw) {
+  const w = String(raw || '').toLowerCase().replace(/’/g, "'");
+  const k = w.indexOf("'");
+  if (k < 0) return w;
+  const head = w.slice(0, k), tail = w.slice(k + 1);
+  if (/^(?:t|m|re|ve|ll|d)$/.test(tail)) return '';
+  if (tail === 's' || tail === '') return (head.length < 3 || STOP.has(head)) ? '' : head;
+  return w.replace(/'/g, '');    // o'clock、rock'n'roll 之类：去掉撇号当一个词
+}
 
 // 英语常用词 / 课堂通用词：用来做 IDF 的「参照系」。
 // 命中这里的词权重会被压低（不是清零——物理课的 force、经济课的 market 仍然要能冒出来），
@@ -235,9 +258,13 @@ function stem(w) {
   return w;
 }
 
-/** 取出英文单词（保留大小写信息由调用方自己判断）。 */
+/**
+ * 取出英文单词（小写、缩写已归一）。
+ * 口语缩写会变成空串留在原位 —— 不直接删掉，是为了让调用方照常把它当停用词「断开」二元搭配，
+ * 否则「art it's modern」删掉中间那个词会凭空拼出 art modern 这种假搭配。
+ */
 function tokens(text) {
-  return String(text || '').toLowerCase().match(/[a-z][a-z'’\-]*[a-z]|[a-z]/g) || [];
+  return (String(text || '').toLowerCase().match(/[a-z][a-z'’\-]*[a-z]|[a-z]/g) || []).map(normWord);
 }
 
 function wordCount(text) {
@@ -245,10 +272,32 @@ function wordCount(text) {
   return m ? m.length : 0;
 }
 
+/**
+ * 常用词判断要认得词形变化：stem() 只管最常见的几种，trying / making / talked / bigger
+ * 这种还原不回 try / make / talk / big，于是在真实课堂里 Trying ×14、Making ×16 被当成了核心术语。
+ * 这里只用于「是不是常用词」的判断，不改动词干本身（主题切分和术语去重仍然用 stem）。
+ */
+function lemmas(w) {
+  const out = [w, stem(w)];
+  const undouble = b => (/([b-df-hj-np-tv-z])\1$/.test(b) ? b.slice(0, -1) : b);
+  if (w.endsWith('ing') && w.length > 5) { const b = w.slice(0, -3); out.push(b, b + 'e', undouble(b)); }
+  if (w.endsWith('ed') && w.length > 3) {
+    const b = w.slice(0, -2); out.push(b, b + 'e', undouble(b));
+    if (b.endsWith('i')) out.push(b.slice(0, -1) + 'y');
+  }
+  if (w.endsWith('es') && w.length > 4) out.push(w.slice(0, -2));
+  if (w.endsWith('s') && w.length > 3) out.push(w.slice(0, -1));
+  if (w.endsWith('ly') && w.length > 5) out.push(w.slice(0, -2));
+  if (w.endsWith('er') && w.length > 5) { const b = w.slice(0, -2); out.push(b, b + 'e', undouble(b)); }
+  if (w.endsWith('est') && w.length > 6) { const b = w.slice(0, -3); out.push(b, b + 'e', undouble(b)); }
+  return out;
+}
+const isCommonForm = w => lemmas(w).some(x => COMMON.has(x));
+
 /** 把一个词的「稀有度」映射成权重：停用词 0，常用词 0.22，其余 1。 */
 function rarity(w) {
-  if (STOP.has(w) || w.length < 3) return 0;
-  if (COMMON.has(w) || COMMON.has(stem(w))) return 0.22;
+  if (!w || w.length < 3 || STOP.has(w)) return 0;
+  if (isCommonForm(w)) return 0.22;
   return w.length >= 9 ? 1.15 : 1;
 }
 
@@ -288,7 +337,9 @@ function cosine(a, b) {
 }
 
 function titleCase(s) {
-  return String(s || '').replace(/\b[a-z]/g, c => c.toUpperCase());
+  // 按「整词」处理：原来用 \b[a-z]，撇号后面也算词首，于是 it's → It'S、don't → Don'T；
+  // 本来就带大写的词（iPad、mRNA、eBay）保持原样，不然 iPad 会变成 IPad
+  return String(s || '').replace(/[A-Za-z][A-Za-z'’]*/g, w => (/[A-Z]/.test(w) ? w : w[0].toUpperCase() + w.slice(1)));
 }
 
 function cleanPhrase(s) {
@@ -495,8 +546,8 @@ function extractTerms(sents, defHintSet) {
     let prev = null;
     for (let k = 0; k < rawWords.length; k++) {
       const raw = rawWords[k];
-      const w = raw.toLowerCase();
-      if (STOP.has(w) || w.length < 3) { prev = null; continue; }
+      const w = normWord(raw);
+      if (!w || STOP.has(w) || w.length < 3) { prev = null; continue; }
       const st = stem(w);
       tf.set(st, (tf.get(st) || 0) + 1);
       const cur = surface.get(st);
@@ -543,6 +594,7 @@ function extractTerms(sents, defHintSet) {
     const cohesion = c / Math.min(ca, cb);
     if (cohesion < 0.55) continue;
     const sa = surface.get(a) || a, sb = surface.get(b) || b;
+    if (INTENSIFIER.has(String(sa).toLowerCase()) || INTENSIFIER.has(a)) continue;   // super overwhelming 不是术语
     const aCommon = COMMON.has(sa) || COMMON.has(a);
     const bCommon = COMMON.has(sb) || COMMON.has(b);
     if (aCommon && bCommon) continue;           // ten percent 这种没信息量
@@ -880,8 +932,8 @@ function detectSuspects(sents, topTerms, tf) {
     for (const s of sents) {
       if (!isAsr(s)) continue;
       for (const raw of (String(s.text).match(/[A-Za-z][A-Za-z'’\-]{4,}/g) || [])) {
-        const w = raw.toLowerCase();
-        if (STOP.has(w) || COMMON.has(w) || COMMON.has(stem(w))) continue;
+        const w = normWord(raw);
+        if (!w || w.length < 5 || STOP.has(w) || COMMON.has(w) || COMMON.has(stem(w))) continue;
         if ((tf.get(stem(w)) || 0) > 1) continue;     // 出现多次就不像听错
         if (seenWord.has(w)) continue;
         for (const term of top) {
@@ -930,7 +982,10 @@ function scoreSentences(sents, termWeight, defIdx, empIdx, taskIdx, formulaIdx) 
 
 /* ============================== 主题标题 ============================== */
 
-function titleForTopic(sents, topic, termWeight, disp) {
+/**
+ * @param {Map<string, number>} [topicDf] 词干 → 在几个主题段里出现过；用来压低「每段都有」的词
+ */
+function titleForTopic(sents, topic, termWeight, disp, topicDf, nTopics) {
   const local = new Map();
   for (let i = topic.start; i <= topic.end; i++) {
     const ws = tokens(sents[i].text);
@@ -949,7 +1004,14 @@ function titleForTopic(sents, topic, termWeight, disp) {
     const parts = k.split(' ');
     const wgt = parts.reduce((a, p) => a + (termWeight.get(p) || 0), 0) / parts.length;
     if (wgt <= 0.05) continue;
-    cand.push({ k, score: (1 + Math.log(c)) * wgt * (parts.length === 2 ? 1.5 : 1) });
+    // 段标题要说「这一段讲了什么」，而不是「整节课是什么课」：现代艺术课每一段都有 art / artist，
+    // 只按全局权重排，12 段里一半标题都是「Art / …」。按「出现在多少段里」打折，越处处都有越往后排。
+    let spread = 1;
+    if (topicDf && nTopics >= 3) {
+      const share = parts.reduce((a, p) => a + (topicDf.get(p) || 1), 0) / parts.length / nTopics;
+      spread = 1 - 0.6 * Math.min(1, share);
+    }
+    cand.push({ k, score: (1 + Math.log(c)) * wgt * spread * (parts.length === 2 ? 1.5 : 1) });
   }
   cand.sort((a, b) => b.score - a.score);
   const names = [];
@@ -957,6 +1019,12 @@ function titleForTopic(sents, topic, termWeight, disp) {
   for (const c of cand) {
     const parts = c.k.split(' ');
     if (parts.some(p => used.has(p))) continue;
+    // 同根词别并排出现：「Photograph / Photography」「Art / Artist」等于只说了一件事
+    const sameRoot = (x, y) => {
+      const [sh, lo] = x.length <= y.length ? [x, y] : [y, x];
+      return sh.length >= 3 && lo.startsWith(sh) && (lo.length - sh.length <= 3 || sh.length >= 5);
+    };
+    if (parts.some(p => [...used].some(u => sameRoot(p, u)))) continue;
     parts.forEach(p => used.add(p));
     names.push(parts.map(p => disp(p)).join(' '));
     if (names.length >= 2) break;
@@ -993,7 +1061,7 @@ export function analyze(segments) {
   // 先跑一遍定义抽取，拿到「老师专门定义过的词」，作为术语打分的先验
   const defs0 = extractDefinitions(sents);
   const defHint = new Set();
-  for (const d of defs0) for (const w of tokens(d.term)) if (!STOP.has(w)) defHint.add(stem(w));
+  for (const d of defs0) for (const w of tokens(d.term)) if (w && !STOP.has(w)) defHint.add(stem(w));
 
   const { terms, tf, surface, display } = extractTerms(sents, defHint);
   const disp = st => display.get(st) || surface.get(st) || st;
@@ -1025,6 +1093,14 @@ export function analyze(segments) {
 
   // 主题切分 + 每段标题 + 每段关键句
   const rawTopics = detectTopics(sents, termWeight);
+  const topicDf = new Map();
+  for (const tp of rawTopics) {
+    const seenHere = new Set();
+    for (let i = tp.start; i <= tp.end; i++) {
+      for (const w of tokens(sents[i].text)) if (w && w.length >= 3 && !STOP.has(w)) seenHere.add(stem(w));
+    }
+    for (const st of seenHere) topicDf.set(st, (topicDf.get(st) || 0) + 1);
+  }
   const topics = rawTopics.map((tp, idx) => {
     const slice = sents.slice(tp.start, tp.end + 1);
     const key = slice.filter(s => s.words >= 7)
@@ -1037,7 +1113,7 @@ export function analyze(segments) {
       tStart: slice.length ? slice[0].t : 0,
       tEnd: slice.length ? slice[slice.length - 1].t : 0,
       sentenceCount: slice.length,
-      title: titleForTopic(sents, tp, termWeight, disp),
+      title: titleForTopic(sents, tp, termWeight, disp, topicDf, rawTopics.length),
       keySentences: key.map(s => ({ i: s.i, t: s.t, text: s.text, zh: s.zh || '' }))
     };
   });
@@ -1080,20 +1156,37 @@ export function analyze(segments) {
  * 本地翻译模型一句要几百毫秒，所以必须限量；
  * 而且分成「长句池」和「术语池」两个预算，免得脉络把额度用光、生词表一个中文都没有。
  */
+const HAS_CJK = /[㐀-䶿一-鿿]/;
+
+/** 译文能不能用：本地小模型会复读、漏译、抄英文，这种中文放进笔记只会误导，宁可不放 */
+function usableZh(zh, en) {
+  const z = cleanPhrase(zh);
+  if (!z) return '';
+  // 术语表给译文补的英文原词「工业革命（industrial revolution）」「［Supreme Court＝最高法院］」不算译文本身，
+  // 带着它判断会被当成「短句译文过长 / 几乎没翻译」，术语表的中文就全没了
+  const core = z.replace(/（[^（）]*）|［[^［］]*］/g, '');
+  try { if (looksDegenerate(core || z, en).bad) return ''; } catch (_) {}
+  return z;
+}
+
 function makeTranslator(translateFn, budget, termBudget) {
   const cache = new Map();
   let used = 0, usedTerm = 0;
   return async function tr(text, fallback, isTerm) {
     const t = cleanPhrase(text);
     if (!t) return '';
-    if (fallback) return fallback;                 // segment 里已经有中文，直接用，省时间
+    // 原句里本来就混着中文（自己敲的中文笔记、识别出来的中英夹杂）就不翻了：
+    // 英→中模型拿到中文只会吐乱码，原句本身她就看得懂
+    if (HAS_CJK.test(t)) return '';
+    // segment 里已经有中文，直接用，省时间；但上课时的实时译文也可能是退化的，坏的照样不要
+    if (fallback) return usableZh(fallback, t);
     if (!translateFn) return '';
     if (cache.has(t)) return cache.get(t);
     if (isTerm) { if (usedTerm >= termBudget) return ''; usedTerm++; }
     else { if (used >= budget) return ''; used++; }
     try {
       const r = await translateFn(t);
-      const zh = cleanPhrase(r || '');
+      const zh = usableZh(r || '', t);
       cache.set(t, zh);
       return zh;
     } catch (_) {
@@ -1101,6 +1194,33 @@ function makeTranslator(translateFn, budget, termBudget) {
       return '';
     }
   };
+}
+
+// 口头语 / 闲聊信号：用来判断一句话「像不像在讲课内容」
+const FILLER_RE = /\b(?:like|you\s+know|kind\s+of|sort\s+of|i\s+mean|okay|ok|right|um+|uh+|yeah|gonna|wanna|gotta|super|really|just|stuff|whatever|crazy|literally|basically|actually|anyway)\b/gi;
+
+/**
+ * 「核心内容」候选打分：在 s.score（术语密度）之上，再看它像不像讲课内容。
+ * 真实课堂里得分最高的句子常常是老师讲段子 / 和学生闲聊（第一人称、like、okay、半截话），
+ * 原样拿去翻译就是「他试图像,好吧, 我要做一个很重要的雕像一个人,我结婚了」这种东西。
+ */
+function lectureScore(s) {
+  if (!s || s.kind === 'note' || HAS_CJK.test(s.text)) return 0;
+  const n = s.words;
+  if (n < 10 || n > 50) return 0;
+  const text = s.text;
+  const content = tokens(text).filter(w => w && w.length >= 3 && !STOP.has(w)).length;
+  const ratio = content / n;                     // 实词占比：讲内容的句子一般 ≥ 0.35
+  if (ratio < 0.25) return 0;
+  const fillers = (text.match(FILLER_RE) || []).length;
+  const firstPerson = (text.match(/\b(?:I|I'm|I’m|I've|I’ve|I'd|I’d|me|my)\b/g) || []).length;
+  const you = (text.match(/\byou(?:'re|’re|r)?\b/gi) || []).length;
+  let v = s.score * (0.4 + ratio);
+  v /= 1 + 0.45 * fillers + 0.3 * firstPerson + 0.15 * you;
+  if (/\?\s*$/.test(text)) v *= 0.4;          // 问句是引子，不是结论
+  if (/\b([A-Za-z]+)\s+\1\b/i.test(text)) v *= 0.6;   // 口吃式重复
+  if (!/[.!。]\s*$/.test(text)) v *= 0.8;       // 没说完的半截话
+  return v;
 }
 
 /* ============================== buildNotes ============================== */
@@ -1144,11 +1264,27 @@ export async function buildNotes(analysis, opts = {}) {
   if (topTerms.length) one += `本节最核心的术语：${topTerms.map(t => '`' + t + '`').join('、')}。`;
   if (tasks.length) one += `另外老师提到了 ${tasks.length} 处作业 / 考试 / 截止时间，见下面的清单。`;
   L.push(one);
-  // 最高分那句话给一个中文的「核心内容」
-  const best = analysis.sentences.slice().sort((a, b) => b.score - a.score)[0];
-  if (best) {
-    const zh = await tr(best.text, best.zh);
-    if (zh) L.push('\n核心内容：' + zh);
+  // 「核心内容」：挑最像讲课内容的一句（实词多、不是闲聊）。
+  // 依次试前几名，译文是退化的就换下一句；都不行就给英文原句 —— 原句至少是真的，乱码译文只会误导。
+  const coreCands = analysis.sentences
+    .map(s => ({ s, v: lectureScore(s) }))
+    .filter(x => x.v > 0)
+    .sort((a, b) => b.v - a.v)
+    .slice(0, 4)
+    .map(x => x.s);
+  // 兜底：一句 10~50 词的都没有（全是短句的课、没标点的长段），退回按原来的分数挑，这一行不能消失
+  if (!coreCands.length) {
+    const best = analysis.sentences.filter(s => s && s.kind !== 'note' && !HAS_CJK.test(s.text) && s.words >= 4)
+      .sort((a, b) => (b.score || 0) - (a.score || 0))[0];
+    if (best) coreCands.push(best);
+  }
+  if (coreCands.length) {
+    let core = '';
+    for (const c of coreCands) {
+      const zh = await tr(c.text, c.zh);
+      if (zh) { core = zh; break; }
+    }
+    L.push('\n核心内容：' + (core || trimTail(coreCands[0].text, 240)));
   }
   L.push('');
   L.push('> 这份笔记由**本机离线分析**生成（没有联网、没有用任何 API Key）。术语、定义、考点、作业都是从转写稿里自动抽取的，可能有遗漏，重要的地方建议对照录音再确认一遍。');

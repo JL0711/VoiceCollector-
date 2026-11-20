@@ -155,7 +155,14 @@ function bindDedication() {
 //   · 发现新版只亮一个小按钮，**绝不弹窗打断**，更不会在录制中动任何东西
 //   · 她点了才下载；下载完也要她点「重启生效」
 //   · 新版本起不来会自动退回（main 进程的 .pending 机制），设置里也有手动「退回上一版」
-const QUICK_MODEL = 'onnx-community/whisper-base';
+// 默认识别模型。2026-10-06 第一次真实课堂录音（59 分钟现代艺术课）实测：
+//   small 比 base 准得多 —— base 把 ancient Greek wall 听成 brick wall、urban 听成 herbal、
+//   「bring art and art together」听成「crime and crime」；死循环也少得多（3 处 vs 24 处）。
+//   small 在 Apple 芯片上整段识别 9 倍实时，上课实时识别 25 秒一段约 3 秒识别完，完全跟得上。
+// 所以快速开始和普通录制都用 small；只有没有 WebGPU 的老电脑（只能 CPU 跑，small 会跟不上）才退回 base。
+const SMALL_MODEL = 'onnx-community/whisper-small';
+const BASE_MODEL = 'onnx-community/whisper-base';
+const defaultModel = info => (info && info.webgpu === false ? BASE_MODEL : SMALL_MODEL);
 const UPD = () => (IS_DESKTOP && window.VCDesktop && window.VCDesktop.update) || null;
 let UPD_INFO = null;
 
@@ -384,10 +391,9 @@ async function startWhisperEngine(mic, st, engine) {
   let info = null;
   try { info = await probeW.probe(); } catch (_) {}
   probeW.terminate();
-  // 默认只用**已经打包在本地**的模型，绝不在上课时才去下载 500MB。
-  // 大教室用 small（远场明显更准），普通教室用 base（更快更省电）。
-  const LOCAL_DEFAULT = st.farMode ? 'onnx-community/whisper-small' : 'onnx-community/whisper-base';
-  let model = st.whisperModel || LOCAL_DEFAULT;
+  // 默认只用**已经打包在本地**的模型，绝不在上课时才去下载 500MB。见 defaultModel 上面的说明。
+  let model = st.whisperModel || defaultModel(info);
+  if (S.cur) S.cur.wmodel = model;
   // 上课时最怕卡住：大模型 90 秒还没就绪就退回 base，宁可准确率低一点也不能不出字
   const FALLBACK = 'onnx-community/whisper-base';
   const onStat = (x) => {
@@ -475,10 +481,10 @@ async function startRecording({ quick = false } = {}) {
     ...(quick ? {} : { lastTeacher: teacherId, lastCourse: courseId })
   });
   // 快速开始只用最稳的一套，**不改她保存的设置**：
-  //   本地 Whisper + 内置 whisper-base（1.4 秒加载、32 倍实时，最不容易卡），
+  //   本地 Whisper + 按设备选的内置模型（有 WebGPU 用 small，否则 base；见 defaultModel），
   //   不开大教室增强、不开自动精修。全程离线，网络再差也不受影响。
   const st = quick
-    ? { ...saved, engine: 'whisper', whisperModel: QUICK_MODEL, farMode: false, boost: 1, autoPerfect: false }
+    ? { ...saved, engine: 'whisper', whisperModel: '', farMode: false, boost: 1, autoPerfect: false }
     : saved;
 
   const engine = quick ? 'whisper' : resolveEngine();
@@ -525,7 +531,7 @@ async function startRecording({ quick = false } = {}) {
     srcLang: st.srcLang, dstLang: st.dstLang,
     segments: [], summary: '', hasAudio: false,
     engine, farMode: !!st.farMode, boost, quick: !!quick,
-    wmodel: (engine === 'whisper' || engine === 'hybrid') ? (st.whisperModel || '') : ''
+    wmodel: ''   // startWhisperEngine 决定用哪个模型后填上
   };
   await db.put('sessions', S.cur);
 
@@ -1280,7 +1286,7 @@ async function redoLocal() {
   if (!rec || !rec.blob) return toast('录音文件找不到了');
 
   const r = await dialog('用录音重新识别整节课', [
-    { name: 'model', label: '用哪个模型（都已内置，不用联网）', type: 'select', value: settings().whisperModel || 'onnx-community/whisper-base',
+    { name: 'model', label: '用哪个模型（都已内置，不用联网）', type: 'select', value: settings().whisperModel || SMALL_MODEL,
       options: [{ v: 'onnx-community/whisper-base', t: '基础版 — 快（约 1 分钟/小时课程）' },
                 { v: 'onnx-community/whisper-small', t: '标准版 — 更准，大教室推荐（约 3 分钟/小时课程）' }] },
     { name: 'mode', label: '怎么处理现在的讲稿', type: 'select', value: 'replace',
@@ -1298,24 +1304,25 @@ async function redoLocal() {
   } catch (e) { setMsg(''); return toast('录音解码失败：' + e.message); }
 
   setMsg(`正在识别 ${Math.round(pcm.length / 16000 / 60)} 分钟的录音…（跑在后台线程，界面不会卡）`);
-  let text = '';
+  let text = '', redoChunks = [];
   try {
     const C = await mod('whisper-client');
     const w = new C.WhisperWorker({ model: r.model, language: String(s.srcLang || 'en').split('-')[0],
       onStatus: (st) => setMsg('识别中…（' + st + '）') });
-    text = await w.transcribeAll(pcm, { model: r.model, language: String(s.srcLang || 'en').split('-')[0], ms: 1800000 });
+    const res = await w.transcribeWithChunks(pcm, { model: r.model, language: String(s.srcLang || 'en').split('-')[0], ms: 1800000 });
     w.terminate();
+    text = res.text; redoChunks = res.chunks;
   } catch (e) { setMsg(''); return toast('识别失败：' + e.message); }
 
   if (!text || !text.trim()) { setMsg(''); return toast('没识别出内容 —— 录音里可能确实没有人声'); }
 
-  // 按句子切开并按时长均匀分配时间戳（整段识别没有逐句时间，只能估算）
-  const sentences = text.split(/(?<=[.!?。！？])\s+/).map(x => x.trim()).filter(Boolean);
-  const total = s.durationMs || (pcm.length / 16000 * 1000);
-  const fresh = sentences.map((t, i) => ({
-    id: uid(), t: Math.round(total * i / Math.max(1, sentences.length)),
-    text: t, zh: '', kind: 'speech', src: 'whisper-redo'
-  }));
+  // 用 Whisper 给的真实时间戳（以前是按句数把时长平均摊，点句子回放会对不上）
+  let fresh = chunksToSegments(redoChunks, 'whisper-redo');
+  if (!fresh.length) {
+    const sentences = text.split(/(?<=[.!?。！？])\s+/).map(x => x.trim()).filter(Boolean);
+    const total = s.durationMs || (pcm.length / 16000 * 1000);
+    fresh = sentences.map((t, i) => ({ id: uid(), t: Math.round(total * i / Math.max(1, sentences.length)), text: t, zh: '', kind: 'speech', src: 'whisper-redo' }));
+  }
 
   const keep = s.segments.filter(x => x.kind !== 'speech');
   if (r.mode === 'replace') {
@@ -1330,6 +1337,144 @@ async function redoLocal() {
   await openSession(s.id);
   await retranslate();
   await regenSummary();
+}
+
+// Whisper 整段识别出来的片段是半句半句的（带真实时间戳）。按句号合成整句，时间用这句第一个片段的时间。
+// 一句最长 40 个词就断开 —— 太长的句子本地翻译模型容易崩。
+function chunksToSegments(chunks, src, offsetSec = 0) {
+  const segs = [];
+  let buf = '', t0 = null;
+  const flush = () => {
+    const x = buf.trim();
+    if (x) segs.push({ id: uid(), t: Math.round((offsetSec + (t0 || 0)) * 1000), text: x, zh: '', kind: 'speech', src });
+    buf = ''; t0 = null;
+  };
+  for (const c of chunks || []) {
+    const ts = c.timestamp || [];
+    if (t0 === null) t0 = ts[0] || 0;
+    buf += ' ' + String(c.text || '').trim();
+    if (/[.!?]["')\]]?$/.test(buf.trim()) || buf.split(/\s+/).length > 40) flush();
+  }
+  flush();
+  return segs;
+}
+
+/* ---------- 导入录音：手机录的、别的 App 录的，拿进来和 App 里录的课一样处理 ---------- */
+// 2026-10-06 她第一次拿真实课堂测试，用的是 iPhone 录的 m4a —— App 却只能自己录，导不进外部录音。
+// 每个文件导入成一节课：本地识别（带真实时间戳）→ 清洗 → 翻译 → 概要 → 存档。全程离线。
+let IMPORTING = false;
+async function importAudioFiles(fileList) {
+  if (S.cur) return toast('正在录课，下课再导入');
+  if (IMPORTING) return toast('上一批还在导入，等它做完');
+  const list = [...(fileList || [])].filter(f => f && f.size).sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+  if (!list.length) return;
+  IMPORTING = true;
+  // 首页（录制页）和资料库各有一个进度框，从哪里点的都看得到
+  const boxes = $$('.import-msg');
+  const say = m => boxes.forEach(b => { b.hidden = false; b.textContent = m; });
+  let lastId = '';
+  const st = settings();
+  const lang = String(st.srcLang || 'en').split('-')[0];
+  let ok = 0;
+  try {
+    const A = await mod('audio'), C = await mod('whisper-client');
+    let info = null;
+    try { const pw = new C.WhisperWorker({}); info = await pw.probe(); pw.terminate(); } catch (_) {}
+    const model = st.whisperModel || defaultModel(info);
+    const speed = model === SMALL_MODEL ? 9 : 19;        // 实测整段识别的倍速（Apple 芯片）
+    for (const [i, f] of list.entries()) {
+      const tag = list.length > 1 ? `（${i + 1}/${list.length}）` : '';
+      say(`正在导入「${f.name}」${tag}：解码录音…`);
+      let pcm;
+      try { pcm = await A.blobToPCM16k(f); }
+      catch (e) { toast(`「${f.name}」解码失败：${e.message}`, 6000); continue; }
+      const minutes = pcm.length / 16000 / 60;
+      say(`正在导入「${f.name}」${tag}：识别 ${Math.round(minutes)} 分钟的录音，大约要 ${Math.max(1, Math.round(minutes / speed))} 分钟。` +
+          '跑在后台线程里，可以先去做别的，别关 App。');
+      const w = new C.WhisperWorker({ model, language: lang });
+      let r;
+      try { r = await w.transcribeWithChunks(pcm, { model, language: lang, ms: Math.max(1800000, minutes * 120000) }); }
+      catch (e) { toast(`「${f.name}」识别失败：${e.message}`, 6000); continue; }
+      finally { w.terminate(); }
+      const segs = chunksToSegments(r.chunks, 'whisper-import');
+      if (!segs.length) { toast(`「${f.name}」里没识别出说话的内容`, 6000); continue; }
+
+      const durationMs = Math.round(minutes * 60000);
+      const endedAt = f.lastModified || Date.now();      // 文件时间大约是录完的时候
+      const s = {
+        id: uid(), teacherId: '', courseId: '', title: f.name.replace(/\.[^.]+$/, ''),
+        startedAt: endedAt - durationMs, endedAt, durationMs,
+        srcLang: st.srcLang, dstLang: st.dstLang, segments: segs, summary: '',
+        hasAudio: true, audioSize: f.size, engine: 'whisper', wmodel: model, imported: f.name
+      };
+      await db.put('audio', { sessionId: s.id, blob: f, type: f.type || 'audio/mp4' });
+      await db.put('sessions', s);
+
+      if (st.dstLang !== 'off') {
+        let done = 0;
+        await T.translateMany(segs, s.srcLang, st.dstLang, (item, zh) => {
+          item.zh = zh; done++;
+          if (done % 10 === 0) say(`正在导入「${f.name}」${tag}：翻译 ${done}/${segs.length}…`);
+        }, 3);
+      }
+      say(`正在导入「${f.name}」${tag}：生成概要…`);
+      const ctx = { teacher: '', course: '', useLocalLLM: st.useLocalLLM, llmModel: st.llmModel };
+      try { s.summary = await summarize(s, ctx, () => {}); } catch (_) { s.summary = localSummary(s, ctx); }
+      await db.put('sessions', s);
+      archiveOne(s).catch(() => {});
+      lastId = s.id;
+      ok++;
+    }
+  } finally {
+    IMPORTING = false;
+  }
+  say(ok ? `导入完成：${ok} 节课。点进去可以补上老师和学科（「现在补上」）。` : '没有导入成功的录音。');
+  setTimeout(() => { boxes.forEach(b => { b.hidden = true; }); }, 10000);
+  if (ok) toast(`导入完成 ${ok} 节 ✓`, 4000);
+  // 只传了一个文件、人还停在录制页 / 资料库 → 直接打开这节课看结果（正在看别的课、在设置页就不打扰）
+  if (ok === 1 && lastId && !S.cur && (S.view === 'record' || S.view === 'library')) go('session', lastId);
+  else if (S.view === 'library') renderLibrary();
+  return ok;
+}
+
+// 把录音文件直接拖进窗口 = 上传识别。
+// 顺带也挡住了 Electron 的默认行为：文件拖进窗口会直接「打开」它、把整个页面换掉 ——
+// 录课时手一滑拖进来一个文件，界面就没了。
+const AUDIO_EXT = /\.(?:m4a|mp3|wav|aac|flac|ogg|oga|opus|webm|caf|mp4|m4b|aif|aiff|amr|3gp|wma)$/i;
+const isAudioFile = f => !!f && (/^audio\//.test(f.type || '') || f.type === 'video/mp4' || AUDIO_EXT.test(f.name || ''));
+function bindDropImport() {
+  const hint = $('#dropHint');
+  const hasFiles = e => Array.from((e.dataTransfer && e.dataTransfer.types) || []).includes('Files');
+  let depth = 0, idle = 0;
+  const hide = () => { depth = 0; hint.hidden = true; clearTimeout(idle); };
+  // 拖到一半按 Esc / 拖出窗口时 dragleave 不一定配对，提示框可能卡在屏幕上；
+  // 悬停时 dragover 每几十毫秒来一次，停了就说明拖动已经结束
+  const keepAlive = () => { clearTimeout(idle); idle = setTimeout(hide, 700); };
+  window.addEventListener('dragenter', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault(); depth++;
+    hint.hidden = false;
+    keepAlive();
+  });
+  window.addEventListener('dragover', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    keepAlive();
+  });
+  window.addEventListener('dragleave', e => {
+    if (!hasFiles(e)) return;
+    if (--depth <= 0) hide();
+  });
+  window.addEventListener('drop', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault(); hide();
+    const files = Array.from(e.dataTransfer.files || []);
+    const audio = files.filter(isAudioFile);
+    if (audio.length) return importAudioFiles(audio).catch(err => toast('导入失败：' + err.message));
+    if (files.some(f => /\.vcpack$/i.test(f.name))) return toast('课程包请到「资料库」点「📥 导入课程包」');
+    toast('拖进来的不是录音文件（支持 m4a / mp3 / wav / aac / flac 等）', 5000);
+  });
 }
 
 /* ---------- 课后用云端 Whisper 把整节课重新转写（需要 API Key） ---------- */
@@ -2421,7 +2566,7 @@ function bindSettings() {
   $('#setFar').addEventListener('change', () => {
     const sel = $('#selWModel');
     if (sel && sel.dataset.filled && !settings().whisperModel) {
-      sel.value = $('#setFar').checked ? 'onnx-community/whisper-small' : 'onnx-community/whisper-base';
+      sel.value = SMALL_MODEL;
     }
   });
   ['#setProvider', '#setKey', '#setBase', '#setModel', '#setAudioBackup', '#setCloudASR',
@@ -2543,8 +2688,7 @@ async function renderEngineUI() {
       sel.innerHTML = p.models.map(m =>
         `<option value="${m.id}">${esc(m.label)} · ${m.sizeMB}MB · ${esc(m.quality || '')}${/base|small/.test(m.id) ? '（已内置）' : '（需联网下载）'}</option>`).join('');
       sel.dataset.filled = '1';
-      const localDefault = st.farMode ? 'onnx-community/whisper-small' : 'onnx-community/whisper-base';
-      sel.value = st.whisperModel || localDefault;
+      sel.value = st.whisperModel || defaultModel(p);
       // ⚠️ 这里以前会 saveSettings({whisperModel: sel.value})。
       // 第一次打开 App 时 farMode 还是关的，于是 whisper-base 被写死进设置，
       // 之后 startRecording 里的 `st.whisperModel || LOCAL_DEFAULT` 永远走前半段，
@@ -2570,7 +2714,8 @@ async function prefetchModels() {
     const probe = new C.WhisperWorker({});
     const p0 = await probe.probe().catch(() => null);
     probe.terminate();
-    const id = st.whisperModel || (p0 && p0.recommended) || 'onnx-community/whisper-base';
+    // 不用 p0.recommended：在 Apple 芯片上它会推荐 large-v3-turbo（没内置，要联网下 500MB+）
+    const id = st.whisperModel || defaultModel(p0);
     toast('开始准备识别模型，第一次会久一点…', 5000);
     const w = new C.WhisperWorker({ model: id, language: String(st.srcLang || 'en').split('-')[0],
       onStatus: (s, d) => {
@@ -2645,6 +2790,11 @@ async function init() {
     } catch (e) { console.warn('[迁移] 跳过：', e && e.message); }
   }
 
+  // 以前设置页一打开就把 whisper-base 自动写进设置（bug，2026-09-24 修了），她并没有选过。
+  // 不清掉的话，「默认改成 small」对已经装过的人不生效 —— 她那里存的就是这个 base。
+  // 以后只有她在下拉框里亲手选过（whisperModelChosen）才算数。
+  { const s0 = settings(); if (s0.whisperModel && !s0.whisperModelChosen) saveSettings({ whisperModel: '' }); }
+
   $('#selSrcLang').innerHTML = LANGS.map(([v, t]) => `<option value="${v}">${t}</option>`).join('');
   const st = settings();
   $('#selSrcLang').value = st.srcLang;
@@ -2691,7 +2841,8 @@ async function init() {
   $('#selSrcLang').onchange = e => { saveSettings({ srcLang: e.target.value }); renderDiag(); if (S.asr) S.asr.setLang(e.target.value); };
   $('#selDstLang').onchange = e => { saveSettings({ dstLang: e.target.value }); renderDiag(); };
   $('#selEngine').onchange = e => { saveSettings({ engine: e.target.value }); renderEngineUI(); };
-  $('#selWModel').onchange = e => saveSettings({ whisperModel: e.target.value });
+  // 她自己在下拉框里选过才算数（whisperModelChosen），见 init 里的一次性清理
+  $('#selWModel').onchange = e => saveSettings({ whisperModel: e.target.value, whisperModelChosen: true });
   $('#btnPrefetch').onclick = prefetchModels;
   $('#btnModelClear').onclick = clearModels;
   $('#libSearch').oninput = debounce(drawLibrary, 200);
@@ -2767,6 +2918,10 @@ async function init() {
   $('#btnRetranscribe').onclick = () => retranscribe().catch(e => toast('转写失败：' + e.message));
   $('#btnRename').onclick = renameSession;
   $('#btnFillMeta').onclick = renameSession;
+  $('#btnImportAudio').onclick = () => $('#fileAudio').click();
+  $('#btnUploadHome').onclick = () => $('#fileAudio').click();
+  bindDropImport();
+  $('#fileAudio').onchange = e => { const fs = e.target.files; importAudioFiles(fs).catch(err => toast('导入失败：' + err.message)).finally(() => { e.target.value = ''; }); };
   $('#btnSumEdit').onclick = openSumEditor;
   if (IS_DESKTOP && window.VCDesktop.archive) {
     $('#selArchive').onchange = e => { saveSettings({ archiveDir: e.target.value }); renderArchiveBox(); };
@@ -2819,7 +2974,7 @@ async function init() {
       .catch(() => {});
     caches.keys().then(ks => ks.forEach(k => { if (k.startsWith('vc-')) caches.delete(k); })).catch(() => {});
   }
-  window.VC = { S, db, T, summarize, settings, _test: { addSegment, stopRecording, startRecording, perfectPass,
+  window.VC = { S, db, T, summarize, settings, _test: { addSegment, stopRecording, startRecording, perfectPass, importAudioFiles,
     setHQ: (e) => { hqMT = e; T.setHighQualityEngine(e); },
     get player() { return PL; }, segRange, shadowPractice } };   // 方便排查问题
 }

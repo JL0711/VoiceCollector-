@@ -165,6 +165,149 @@ function tidyCJK(zh) {
   return t.replace(/\s{2,}/g, ' ').replace(/\s+([，。、；：？！）】」』])/g, '$1').trim();
 }
 
+// ---- 长句切块：只给本地 opus-mt 用 ----
+// opus-mt 碰到 25 词以上的长句很容易崩：要么自己死循环（「…工厂里。。。,我们开始做一些新的,,我们做一些东西…」），
+// 要么被劣化检测拦下来变成空。真实课堂录音里 45 词以上的段落将近一半没有中文，
+// 而实时识别每 25 秒出一段，一段正好 50~70 词 —— 上课时天天撞上。
+// 所以送进模型之前先按句子切，单句太长的再按从句边界切，每块不超过约 22 词，分别翻译再拼回去。
+const LOCAL_MAX_WORDS = 22;     // 每块最多多少词
+const LOCAL_MIN_WORDS = 4;      // 切出来的块至少多少词（太碎的半截话模型也翻不好）
+const wordsOf = t => String(t || '').trim().split(/\s+/).filter(Boolean);
+
+// 句末缩写 / 姓名首字母后面的点不是句号（"Mr. Smith"、"George W. Bush"、"e.g. this"）
+const ABBR_END = /(?:\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|Mt|vs|etc|No)|\be\.g|\bi\.e|\bU\.S|\b[A-Z])\.$/i;
+
+function splitSentencesEN(t) {
+  const parts = String(t || '').split(/(?<=[.!?…]["')\]]?)\s+/);
+  const out = [];
+  for (const p of parts) {
+    if (!p) continue;
+    if (out.length && ABBR_END.test(out[out.length - 1])) out[out.length - 1] += ' ' + p;
+    else out.push(p);
+  }
+  return out;
+}
+
+// 从句边界的优先级（数字越小越优先）
+const CONJ_COMMA = new Set(['and', 'but', 'so', 'because', 'or', 'which', 'where', 'when', 'while', 'although',
+  'though', 'whereas', 'since', 'unless', 'until', 'if', 'then', 'cause', "'cause"]);
+const CONJ_BARE = new Set(['and', 'but', 'so', 'because', 'which', 'where', 'when', 'while', 'although',
+  'though', 'whereas', 'since', 'unless', 'until', 'if', 'or']);
+// Whisper 的口语长句常常一个逗号都没有，只能在「新主语」前面切
+const SUBJ_HEAD = new Set(['i', "i'm", "i've", "i'll", "i'd", 'we', "we're", "we've", "we'll", 'they', "they're",
+  "they've", "there's", "that's", "it's", "you're", "you've", "you'll", "he's", "she's"]);
+const bareWord = w => String(w || '').toLowerCase().replace(/[’]/g, "'").replace(/^[^a-z']+|[^a-z']+$/g, '');
+
+// 切口前面是介词/冠词/系动词这类「话没说完」的词（"some kind of, | you know"）→ 尽量不在这里切
+const TAIL_BAD = new Set(['a', 'an', 'the', 'of', 'to', 'for', 'with', 'about', 'from', 'in', 'on', 'at', 'by',
+  'into', 'between', 'like', 'and', 'or', 'but', 'is', 'are', 'was', 'were', 'be', 'my', 'your', 'our', 'their',
+  'his', 'her', 'its', 'this', 'that', 'these', 'those', 'very', 'really', 'kind', 'sort', 'some']);
+
+function boundaryTier(a, b) {
+  if (TAIL_BAD.has(bareWord(a))) return 7;
+  if (/[0-9],$/.test(a) && /^[0-9]/.test(b)) return 7;            // "100, 150 people" 是数字，不是从句
+  if (/[;:]$/.test(a)) return 1;
+  if (/,$/.test(a)) return CONJ_COMMA.has(bareWord(b)) ? 2 : 3;
+  if (/[A-Za-z0-9'’]$/.test(a)) {
+    if (CONJ_BARE.has(bareWord(b))) return 4;
+    if (SUBJ_HEAD.has(bareWord(b))) return 5;
+  }
+  return 6;
+}
+
+// 单句超长 → 递归二分。先挑优先级最高的边界，同一优先级里挑最接近「理想位置」的
+// （理想位置按「最终要切成几块」均分，避免切出一大块 + 一小块）
+function splitClauses(ws) {
+  const n = ws.length;
+  if (n <= LOCAL_MAX_WORDS) return [ws.join(' ')];
+  const k = Math.ceil(n / LOCAL_MAX_WORDS);
+  const target = Math.round(n * Math.floor(k / 2) / k);
+  let best = -1, bestTier = 99, bestDist = 1e9;
+  for (let i = LOCAL_MIN_WORDS; i <= n - LOCAL_MIN_WORDS; i++) {   // 切在 ws[i-1] 和 ws[i] 之间
+    const tier = boundaryTier(ws[i - 1], ws[i]);
+    const dist = Math.abs(i - target);
+    if (tier < bestTier || (tier === bestTier && dist < bestDist)) { best = i; bestTier = tier; bestDist = dist; }
+  }
+  if (best < 0) best = Math.round(n / 2);
+  return [...splitClauses(ws.slice(0, best)), ...splitClauses(ws.slice(best))];
+}
+
+// 整段 → 若干块（每块 ≤ LOCAL_MAX_WORDS 词）。
+// 不把相邻的句子拼回一块：mt.js 内部本来就逐句翻译，拼起来既不多给上下文，
+// 反而让「一句短句翻坏 → 整块被劣化检测毙掉」，连带好的那句一起丢。
+function splitForLocal(t) {
+  // 带空格的破折号当成分号处理（课堂口语里就是一个停顿）
+  const s = String(t || '').replace(/\s+(?:—|–|--?)\s+/g, '; ').trim();
+  const chunks = [];
+  for (const sen of splitSentencesEN(s)) chunks.push(...splitClauses(wordsOf(sen)));
+  return chunks.filter(Boolean);
+}
+
+// 一块译文接下一块之前，句尾用什么中文标点（按这块英文原文的结尾来定）
+function joinPiece(zh, en) {
+  let z = String(zh || '').trim();
+  const e = String(en || '').trim();
+  if (/[?？!！]$/.test(z)) return z.replace(/\?$/, '？').replace(/!$/, '！');
+  z = z.replace(/[，,、；;：:。.\s]+$/, '');
+  if (!z) return '';
+  if (/[.…]["')\]]?$/.test(e)) return z + '。';
+  if (/\?["')\]]?$/.test(e)) return z + '？';
+  if (/!["')\]]?$/.test(e)) return z + '！';
+  if (/;$/.test(e)) return z + '；';
+  return z + '，';
+}
+
+// 小模型在孤立短句上爱复读标点（"What else?" → 「还有什么???????」，"TV shows." → 「电视节目。。。。。。」），
+// 后面还常拖一串「,我...,我...」。这类译文正文其实是对的，劣化检测不过时先抢救一次：
+// 去掉「,我...」这种碎尾巴、把成串的标点收成一个，再重新过一遍劣化检测。只用在长段落分块这条路上。
+function salvageLoops(zh) {
+  let z = String(zh || '');
+  z = z.replace(/[，,]\s*[\u4e00-\u9fff]{0,3}(?:\.{2,}|…+)/g, '');
+  z = z.replace(/[。？！，、?!,.…]{2,}/g, run =>
+    /[?？]/.test(run) ? '？' : /[!！]/.test(run) ? '！' : /[。.…]/.test(run) ? '。' : '，');
+  return z.trim();
+}
+
+// 半截短句（< 3 词）里纯语气词的块直接略过；其余的哪怕很短也翻（"Love it." 是内容，不是碎片）
+const PIECE_FILLER = /^(?:um+|uh+|yeah|yes|yep|no|ok|okay|mhm+|hmm+|right|so|well|like|oh|ah)(?:[\s.,!?]+(?:um+|uh+|yeah|yes|yep|no|ok|okay|mhm+|hmm+|right|so|well|like|oh|ah))*[\s.,!?]*$/i;
+
+// 长段落分块走本地模型：每块各自做术语预处理 → 翻译 → 清空格 → 劣化检测。
+// ⚠️ 每块单独调 m.translate，**不要**改成一次 m.translateMany 凑批：
+// 实测 mt.js 把长短不一的句子凑成一批推理时，短句在批里会一直生成到长度上限，
+// 后面拖一长串「。。。。」「,我...,我...」或整句复读（真实数据 53 块里 48 块坏），
+// 单独翻同样 53 块只坏 2 块。推理在 mt.js 里本来就是串行的，不凑批也不会更慢多少。
+// 某一块翻坏了只丢那一块（用「……」占位），其余块照样返回；全坏了才返回空。
+async function translateLocalPieces(m, pieces, G) {
+  const plan = await Promise.all(pieces.map(async (p) => {
+    if (PIECE_FILLER.test(p.trim())) return { skip: true };
+    if (wordsOf(p).length >= 3 && !G.skip(p)) return { skip: true };
+    const pre = G.pre(p);
+    if (!pre) return { skip: true };
+    let zh = '';
+    try { zh = tidyCJK((await withTimeout(m.translate(pre), 30000, '')) || ''); } catch (_) { zh = ''; }
+    if (zh && G.bad(zh, pre).bad) {
+      zh = salvageLoops(zh);
+      if (zh && G.bad(zh, pre).bad) zh = '';
+    }
+    return { zh };
+  }));
+  let out = '', ok = 0, failed = 0;
+  for (let i = 0; i < plan.length; i++) {
+    const r = plan[i];
+    if (r.skip) continue;
+    if (!r.zh) {
+      failed++;
+      if (!out.endsWith('……')) out += '……';
+      continue;
+    }
+    ok++;
+    // 最后一块保留模型自己的结尾标点，前面的块统一换成中文标点再接
+    const isLast = !plan.slice(i + 1).some(x => !x.skip);
+    out += isLast ? r.zh : joinPiece(r.zh, pieces[i]);
+  }
+  return { zh: ok ? out : '', partial: failed > 0 };
+}
+
 // 高质量引擎（本地 LLM）。由 app.js 在需要时注入，避免 translate.js 直接依赖大模块。
 let hiq = null;
 export function setHighQualityEngine(engine) { hiq = engine; }
@@ -175,6 +318,9 @@ export function highQualityReady() { return !!(hiq && hiq.ready); }
 // 两轮跑的就是同一个模型，双模型择优直接退化成单模型 —— 这个坑踩过一次。
 export async function translate(text, src, dst, opts) {
   if (!text || dst === 'off') return '';
+  // 原文里已经混了中文（学生用中文讨论、老师夹一句中文，被识别成了汉字）→ 不翻译，
+  // 不然本地模型会把中文原样抄回来，或者把半中半英翻成一团乱
+  if (/[\u3400-\u9fff\uf900-\ufaff]/.test(text)) return '';
   const key = (opts && opts.skipHQ ? 'fast|' : '') + dst + '|' + text;
   if (cache.has(key)) return cache.get(key);
 
@@ -188,6 +334,7 @@ export async function translate(text, src, dst, opts) {
   const src_ = G.pre(text);
 
   let out = '';
+  let partial = false;                             // 长段落分块翻译时有块翻坏了：照样返回，但不进缓存
 
   // 第一梯队：本地 LLM（质量最好）
   if (hiq && hiq.ready && !(opts && opts.skipHQ)) {
@@ -208,7 +355,15 @@ export async function translate(text, src, dst, opts) {
   // 本地 OPUS-MT（快，做实时字幕），出来的结果要过劣化检测
   if (!out) {
     const m = await getLocalMT();
-    if (m) {
+    // 超过 LOCAL_MAX_WORDS 词的长段落先切块再翻（见 splitForLocal）；短句走原来的路，行为不变
+    const pieces = (wordsOf(text).length > LOCAL_MAX_WORDS && wordsOf(src_).length > LOCAL_MAX_WORDS)
+      ? splitForLocal(src_) : null;
+    if (m && pieces && pieces.length > 1) {
+      try {
+        const r = await translateLocalPieces(m, pieces, G);
+        out = r.zh; partial = r.partial;
+      } catch (_) { out = ''; }
+    } else if (m) {
       try { out = tidyCJK((await withTimeout(m.translate(src_), 30000, '')) || ''); } catch (_) {}
       if (out) {
         const v = G.bad(out, src_);
@@ -227,7 +382,7 @@ export async function translate(text, src, dst, opts) {
   }
   if (out) {
     try { out = G.fix(src_, out); } catch (_) {}   // 术语表纠正
-    cache.set(key, out);
+    if (!partial) cache.set(key, out);             // 缓存仍以整段原文为 key
   }
   return out;
 }

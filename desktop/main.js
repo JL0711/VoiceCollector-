@@ -66,6 +66,13 @@ function resolveWebRoot() {
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required'); // 回放录音不用先点一下
 app.commandLine.appendSwitch('enable-features', 'SharedArrayBuffer');        // 配合 COOP/COEP，Whisper 多线程要用
 app.commandLine.appendSwitch('disable-features', 'HardwareMediaKeyHandling'); // 别抢系统播放键
+// 测试专用：拿一个 wav 当麦克风，按真实时间走一遍「上课实时识别」（只在 --smoke-test 下生效）
+if (SMOKE && process.env.VC_FAKE_MIC) {
+  app.commandLine.appendSwitch('use-fake-device-for-media-stream');
+  app.commandLine.appendSwitch('use-file-for-fake-audio-capture', process.env.VC_FAKE_MIC + '%noloop');
+  // 音频服务在沙箱里读不了任意路径的文件（报 Failed to read … as input to the fake device）
+  app.commandLine.appendSwitch('no-sandbox');
+}
 
 // 省电说明：这里故意【不】调 app.disableHardwareAcceleration()。
 // GPU 加速对我们是净省电的 —— Whisper 走 WebGPU 比纯 CPU 快好几倍，
@@ -402,7 +409,9 @@ function setupIpc() {
   // ── 更新（只换网页层，见 lib/updater.js 顶部） ──
   // 更新源：GitHub Releases。仓库是公开的，任何装了这个 App 的人都能收到更新提示，
   // 不需要登录、不需要 Key。
-  const UPD = { owner: 'MartinMax0711', repo: 'VoiceCollector-' };
+  // 仓库 2026-10 从 MartinMax0711 转到了 JL0711。GitHub 会对旧地址做跳转，但旧名字一旦被人重新占用跳转就断了，
+  // 而且「去下载」的白名单是按这个 owner 拼的 —— 不改的话新地址的下载链接会被拦掉。
+  const UPD = { owner: 'JL0711', repo: 'VoiceCollector-' };
   const bundledVersion = () => {
     const m = httpServer ? updater.readManifest(httpServer.root) : null;
     return (m && m.version) || '0.0.0';
@@ -669,15 +678,17 @@ function filtersFor(name, mime) {
 // ───────────────────────── 冒烟测试 ─────────────────────────
 // 无头/CI 环境下用：`npx electron . --smoke-test`
 function runSmokeTest(win, web) {
-  // 总看门狗：不管卡在哪一步，120 秒还没出结果就判失败。
+  // 总看门狗：不管卡在哪一步，到点还没出结果就判失败（默认 120 秒）。
   // 「网络卡死」这类问题的表现恰恰就是永远不结束，没有这个的话测试会一直挂着。
+  // 导入一整节真实录音要识别好几分钟，用 VC_SMOKE_TIMEOUT（秒）放宽。
+  const limitSec = Number(process.env.VC_SMOKE_TIMEOUT) || 120;
   const watchdog = setTimeout(() => {
     console.log('===VC_SMOKE_BEGIN===');
-    console.log(JSON.stringify({ ok: false, error: '120 秒没跑完 —— 卡死了', hung: true,
+    console.log(JSON.stringify({ ok: false, error: limitSec + ' 秒没跑完 —— 卡死了', hung: true,
       net: { mode: process.env.VC_NET || 'normal', external: externalRequests.slice() } }, null, 2));
     console.log('===VC_SMOKE_END===');
     app.exit(1);
-  }, 120000);
+  }, limitSec * 1000);
   const out = res => {
     clearTimeout(watchdog);
     console.log('===VC_SMOKE_BEGIN===');
@@ -757,6 +768,16 @@ function runSmokeTest(win, web) {
         // 常量、改名忘了改引用）都只有在真正走 startRecording 的时候才炸，
         // 而那正是她在教室里唯一会做的事。14:27 那一版就是这么发出去的：
         // 界面完全正常，一点「开始录制」直接 "FRAG is not defined"。
+        // 导入录音的测试文件：主进程读出来，以 base64 交给页面（页面读不了本机任意路径）
+        let importB64 = '', importName = '';
+        if (process.env.VC_SMOKE_IMPORT) {
+          try { importB64 = fs.readFileSync(process.env.VC_SMOKE_IMPORT).toString('base64'); importName = path.basename(process.env.VC_SMOKE_IMPORT); } catch (_) {}
+        }
+        // 首页「📂 上传录音」按钮 + 拖文件进窗口：两条路各导一次
+        let uploadB64 = '', uploadName = '';
+        if (process.env.VC_SMOKE_UPLOAD) {
+          try { uploadB64 = fs.readFileSync(process.env.VC_SMOKE_UPLOAD).toString('base64'); uploadName = path.basename(process.env.VC_SMOKE_UPLOAD); } catch (_) {}
+        }
         const rec = await win.webContents.executeJavaScript(`(async () => {
           const r = { ok:false, error:'', addedTeacher:false, addedCourse:false,
                       started:false, stopped:false, engine:'', segs:0, sessionId:'' };
@@ -794,6 +815,108 @@ function runSmokeTest(win, web) {
           };
           // 更新：当前用的是哪个版本（演练「更新」「坏更新自动退回」要看这个）
           try { r.updState = await window.VCDesktop.update.state(); } catch (e) { r.updState = { error: e.message }; }
+          // 老师讲课语言：走设置页那个下拉框，和她自己改一样（测中文课用）
+          if (${JSON.stringify(process.env.VC_SMOKE_SRCLANG || '')}) {
+            const sel = q('#selSrcLang');
+            sel.value = ${JSON.stringify(process.env.VC_SMOKE_SRCLANG || '')};
+            sel.dispatchEvent(new Event('change', { bubbles: true }));
+            r.srcLang = VC.settings().srcLang;
+          }
+          // 导入录音：和她用手机录完拿进来一样，走完 识别 → 翻译 → 概要 → 存档
+          if (${JSON.stringify(importB64 ? importName : '')}) {
+            try {
+              const bin = atob(${JSON.stringify(importB64)});
+              const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+              const file = new File([u], ${JSON.stringify(importName)}, { type: 'audio/mp4', lastModified: Date.now() });
+              const before = (await VC.db.all('sessions')).length;
+              const n = await VC._test.importAudioFiles([file]);
+              const all = await VC.db.all('sessions');
+              const s = all.find(x => x.imported === ${JSON.stringify(importName)});
+              const speech = s ? s.segments.filter(x => x.kind === 'speech') : [];
+              let arch = null;
+              for (let i = 0; i < 60 && s; i++) { arch = await VC.db.get('sessions', s.id); if (arch && (arch.archivedAt || arch.archiveError)) break; await new Promise(r => setTimeout(r, 200)); }
+              const au = s ? await VC.db.get('audio', s.id) : null;
+              r.import = { ok: n === 1 && all.length === before + 1, segs: speech.length, model: s && s.wmodel,
+                text: speech.map(x => x.text).join(' ').slice(0, 160), zh: speech.filter(x => x.zh).length,
+                firstT: speech[0] ? speech[0].t : null, lastT: speech.length ? speech[speech.length - 1].t : null,
+                summary: !!(s && s.summary && s.summary.length > 30), audio: !!(au && au.blob && au.blob.size),
+                archived: !!(arch && arch.archivedAt), archiveError: arch && arch.archiveError };
+            } catch (e) { r.import = { ok: false, error: e.message }; }
+          }
+          if (${JSON.stringify(uploadB64 ? uploadName : '')}) {
+            const up = r.upload = {};
+            try {
+              const bin = atob(${JSON.stringify(uploadB64)});
+              const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i);
+              const mk = name => new File([u], name, { type: 'audio/mp4', lastModified: Date.now() });
+              const ext = ${JSON.stringify(path.extname(uploadName || '.m4a'))};
+              // 不能用 offsetParent 判断：position:fixed 的元素（拖拽提示）offsetParent 永远是 null
+              const shown = el => !!el && !el.hidden && getComputedStyle(el).display !== 'none' && el.getClientRects().length > 0;
+              // 导完 = 这节课有了概要（importAudioFiles 最后一步才写）；然后看它有没有自己打开这节课
+              const waitDone = async name => {
+                const end = Date.now() + 600000;
+                let s = null;
+                while (Date.now() < end) {
+                  s = (await VC.db.all('sessions')).find(x => x.imported === name && x.summary);
+                  if (s) break;
+                  await sleep(300);
+                }
+                if (!s) return { s: null, opened: false };
+                const opened = await until(() => VC.S.view === 'session' && VC.S.detail && VC.S.detail.id === s.id, 5000);
+                return { s, opened };
+              };
+              // ① 首页按钮：在录制页、第一屏就看得到
+              document.querySelector('[data-go="record"]').click();
+              await sleep(200);
+              up.homeButtonVisible = shown(q('#btnUploadHome'));
+              let picker = false;
+              const inp = q('#fileAudio'), realClick = inp.click;
+              inp.click = () => { picker = true; };       // 不真的弹系统的选文件窗口
+              q('#btnUploadHome').click();
+              inp.click = realClick;
+              up.opensPicker = picker;
+              const nameA = 'upload-button' + ext;
+              const dt = new DataTransfer(); dt.items.add(mk(nameA));
+              inp.files = dt.files;
+              inp.dispatchEvent(new Event('change', { bubbles: true }));
+              await until(() => shown(q('#importMsgHome')), 8000);
+              up.homeProgressShown = shown(q('#importMsgHome'));
+              up.homeProgressText = (q('#importMsgHome').textContent || '').slice(0, 60);
+              const { s: sA, opened: openedA } = await waitDone(nameA);
+              up.buttonImported = !!sA;
+              up.buttonOpenedSession = openedA;
+              up.buttonSegs = sA ? sA.segments.filter(x => x.kind === 'speech').length : 0;
+              up.buttonText = sA ? sA.segments.filter(x => x.kind === 'speech').map(x => x.text).join(' ').slice(0, 120) : '';
+              // ② 拖进窗口
+              document.querySelector('[data-go="record"]').click();
+              await sleep(200);
+              const nameB = 'upload-drop' + ext;
+              const dt2 = new DataTransfer(); dt2.items.add(mk(nameB));
+              document.body.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt2 }));
+              await sleep(50);
+              up.dropHintShown = shown(q('#dropHint'));
+              const over = new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt2 });
+              document.body.dispatchEvent(over);
+              up.dragoverPrevented = over.defaultPrevented;      // 不 preventDefault 的话 Electron 会把整个页面换成这个文件
+              const drop = new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt2 });
+              document.body.dispatchEvent(drop);
+              up.dropPrevented = drop.defaultPrevented;
+              await sleep(50);
+              up.dropHintHidden = !shown(q('#dropHint'));
+              const { s: sB, opened: openedB } = await waitDone(nameB);
+              up.dropImported = !!sB;
+              up.dropOpenedSession = openedB;
+              // ③ 拖进来一个不是录音的文件：不导入、给提示
+              const before = (await VC.db.all('sessions')).length;
+              const dt3 = new DataTransfer(); dt3.items.add(new File(['hello'], 'notes.txt', { type: 'text/plain' }));
+              document.body.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt3 }));
+              await sleep(400);
+              up.nonAudioToast = toastText();
+              up.nonAudioIgnored = (await VC.db.all('sessions')).length === before;
+              document.querySelector('[data-go="record"]').click();
+              await sleep(200);
+            } catch (e) { up.error = e.message; }
+          }
           if (${JSON.stringify(process.env.VC_SMOKE_UPDATE || '')} === 'install') {
             try {
               r.updCheck = await window.VCDesktop.update.check();
@@ -840,7 +963,9 @@ function runSmokeTest(win, web) {
 
             r.sessionId = VC.S.cur.id;
             r.engine = VC.S.cur.engine || '';
-            r.wmodel = VC.S.cur.wmodel || '';
+            // 用哪个模型要等识别线程探测完设备才定（见 app.js defaultModel），别读早了
+            if (r.engine === 'whisper') await until(() => VC.S.cur && VC.S.cur.wmodel, 15000);
+            r.wmodel = (VC.S.cur && VC.S.cur.wmodel) || '';
             if (FLOW === 'quick') {
               r.quickNoMeta = !VC.S.cur.teacherId && !VC.S.cur.courseId;
               r.quickTitle = VC.S.cur.title;
@@ -850,9 +975,12 @@ function runSmokeTest(win, web) {
             // 否则她看到的就是一片空白 + 0 段 0 词，会以为没录上。
             r.waitingShown = !!q('#liveTranscript .waiting');
 
+            // 假麦克风：让那段录音按真实时间放完（实时识别 25 秒一窗，最后一窗下课时 flush）
+            const LISTEN = ${JSON.stringify(Number(process.env.VC_SMOKE_LISTEN) || 0)};
+            if (LISTEN) await sleep(LISTEN * 1000);
             // 顺手把落段这条链路走通：Electron 里没有 Web Speech，
             // 不直接喂它的话这段代码在桌面版永远测不到。
-            VC._test.addSegment({ text: 'The Supreme Court decided this case in nineteen sixty four.', kind: 'speech', t: 0 });
+            if (!LISTEN) VC._test.addSegment({ text: 'The Supreme Court decided this case in nineteen sixty four.', kind: 'speech', t: 0 });
             await sleep(200);
             if (WITH_ZH) {
               // 实时翻译要在 40 秒内出中文（本地 opus-mt，第一次要加载模型）
@@ -910,6 +1038,14 @@ function runSmokeTest(win, web) {
               r.archived = !!(sx && sx.archivedAt);
               r.archiveRel = (sx && sx.archiveRel) || '';
               r.archiveError = (sx && sx.archiveError) || '';
+              if (LISTEN && sx) {
+                // 等下课后的翻译 / 概要跑完再取（stopRecording 上面最多只等了 15 秒）
+                await until(() => VC.S.detail && VC.S.detail.summary, 60000);
+                const sz = await VC.db.get('sessions', r.sessionId);
+                r.listen = { srcLang: sz.srcLang, wmodel: sz.wmodel,
+                  segs: (sz.segments || []).filter(x => x.kind === 'speech').map(x => ({ t: x.t, text: x.text, zh: x.zh || '' })),
+                  summary: sz.summary || '' };
+              }
             }
             // 概要编辑器：改一句，保存，数据库和存档都要跟着变
             if (r.stopped && FLOW !== 'quick') {
@@ -978,7 +1114,7 @@ function runSmokeTest(win, web) {
                  && (r.flow === 'quick' || (r.editedSaved && r.editedArchived && r.notesShows && /archive-test/.test(r.archiveBoxWhere) && r.archiveAllOk))
                  && (!${JSON.stringify(process.env.VC_SMOKE_TRANSLATE === '1')} || /[\u4e00-\u9fff]/.test(r.zh || ''))
                  && (r.flow !== 'quick' || (r.quickNoMeta && r.engine === 'whisper'
-                      && /whisper-base/.test(r.wmodel) && r.metaMissShown && r.filled && r.metaMissHiddenAfter));
+                      && /whisper-(small|base)/.test(r.wmodel) && r.metaMissShown && r.filled && r.metaMissHiddenAfter));
           return r;
         })()`, true);
 

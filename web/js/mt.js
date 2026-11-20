@@ -29,6 +29,7 @@
 
 import { pipeline, env } from '../vendor/transformers/transformers.min.js';
 import { ortWasmPaths, isBundled } from './ort-paths.js';
+import { looksDegenerate } from './glossary.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // 运行时：本地模型优先（完全离线），本地没有才去远端下载
@@ -465,6 +466,26 @@ async function getPersist() {
   return _persist;
 }
 
+// 磁盘缓存的键前缀。2026-10-06 从 'mt:' 换成 'mt2:'：旧版凑批翻译（见 _batchSize）把大量乱码
+// 按句子存进了缓存，迁移旧数据时还跟着搬到了新端口；不换前缀的话，升级以后同样的句子会直接读到旧乱码。
+// 旧前缀的记录在 cleanupOldCache() 里清一次。
+const MT_CACHE_PREFIX = 'mt2:';
+let _cleanupStarted = false;
+async function cleanupOldCache() {
+  if (_cleanupStarted) return;
+  _cleanupStarted = true;
+  try {
+    const db = await import('./db.js');
+    if (await db.get('kv', 'mt.cache.cleaned.v2')) return;
+    const all = await db.all('kv');
+    for (const r of all) {
+      const k = r && (r.k || r.key || r.id);
+      if (typeof k === 'string' && k.startsWith('mt:')) await db.del('kv', k);
+    }
+    await db.put('kv', { k: 'mt.cache.cleaned.v2', id: 'mt.cache.cleaned.v2', key: 'mt.cache.cleaned.v2', at: Date.now() });
+  } catch (_) { /* 清不掉也不影响翻译，只是占点空间 */ }
+}
+
 function openOwnDB() {
   return new Promise((res, rej) => {
     if (typeof indexedDB === 'undefined') return rej(new Error('no indexedDB'));
@@ -672,7 +693,11 @@ export class LocalMT {
   //   webgpu    → 16。显存主要被 65001 维的 logits 吃掉：16 × 65001 × 4B ≈ 4MB/步，安全。
   _batchSize() {
     if (this._userBatch) return Math.max(1, this._userBatch | 0);
-    return this.device === 'webgpu' ? 16 : 8;
+    // ⚠️ 默认一句一句翻，**不凑批**。2026-10-06 用真实课堂录音实测：几句凑成一批推理时，
+    //    批里短的那几句会一直生成到长度上限，拖出「。。。。」「,我...,我...」或者整句复读 ——
+    //    同样 53 块，凑批翻坏 48 块，单独翻只坏 2 块；而且单独翻并不更慢（不用陪着生成一长串垃圾）。
+    //    以前合成语音测试句子短而整齐，凑批的毛病一直没暴露。
+    return 1;
   }
 
   // ── 串行队列 ────────────────────────────────────────────────────────────
@@ -704,10 +729,11 @@ export class LocalMT {
 
   async _diskGet(chunk) {
     if (!this.persist) return undefined;
+    cleanupOldCache();   // 不 await：后台清，清一次就记账
     try {
       const p = await getPersist();
       if (!p) return undefined;
-      const rec = await p.get('mt:' + this.cfg.id + ':' + hashKey(chunk));
+      const rec = await p.get(MT_CACHE_PREFIX + this.cfg.id + ':' + hashKey(chunk));
       // 必须比对原文：哈希再长也可能碰撞，翻错一句比慢一点严重得多
       if (rec && rec.src === chunk && typeof rec.out === 'string') return rec.out;
     } catch (_) {}
@@ -719,7 +745,7 @@ export class LocalMT {
     try {
       const p = await getPersist();
       if (!p) return;
-      await p.put({ k: 'mt:' + this.cfg.id + ':' + hashKey(chunk), src: chunk, out, t: Date.now() });
+      await p.put({ k: MT_CACHE_PREFIX + this.cfg.id + ':' + hashKey(chunk), src: chunk, out, t: Date.now() });
     } catch (_) {}
   }
 
@@ -774,8 +800,13 @@ export class LocalMT {
         const raw = outs && outs[k] ? (outs[k].translation_text ?? outs[k].generated_text ?? '') : '';
         const out = String(raw).trim();
         result.set(texts[k], out);
-        this._memSet(texts[k], out);
-        this._diskSet(texts[k], out);   // 故意不 await，落盘失败不该拖慢翻译
+        // 乱码不进缓存：存进去的话这句以后永远拿到同一份乱码（生成是确定性的）
+        let bad = false;
+        try { bad = !!(out && looksDegenerate(out, texts[k]).bad); } catch (_) {}   // 签名是 (中文, 英文)
+        if (!bad) {
+          this._memSet(texts[k], out);
+          this._diskSet(texts[k], out);   // 故意不 await，落盘失败不该拖慢翻译
+        }
       }
     }
     return result;

@@ -1,7 +1,7 @@
 {
   "name": "voicecollector-desktop",
   "productName": "VoiceCollector",
-  "version": "1.0.1",
+  "version": "1.0.3",
   "description": "VoiceCollector 桌面版 · 大学课堂实时记录、中文翻译与课堂笔记生成",
   "author": {
     "name": "VoiceCollector",

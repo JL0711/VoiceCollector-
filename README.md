@@ -5,7 +5,7 @@
 
 ## 下载
 
-到 **[Releases](https://github.com/MartinMax0711/VoiceCollector-/releases/latest)** 下载：
+到 **[Releases](https://github.com/JL0711/VoiceCollector-/releases/latest)** 下载：
 
 | 文件 | 给谁 |
 |---|---|

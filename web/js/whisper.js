@@ -472,10 +472,9 @@ export class LocalWhisper {
         opts.task = 'transcribe'
       }
       const out = await pipe(float32At16k, opts)
-      return {
-        text: (out && out.text ? String(out.text) : '').trim(),
-        chunks: (out && out.chunks) || []
-      }
+      // 清洗死循环和重复识别（见 cleanTranscript 上面的说明）。流式那边自己清洗，这里只管整段。
+      const raw = { text: (out && out.text ? String(out.text) : '').trim(), chunks: (out && out.chunks) || [] }
+      return timestamps === false ? raw : cleanTranscript(raw)
     }
 
     this._queue = this._queue.then(run, run)
@@ -543,6 +542,116 @@ function tokenize (text) {
 
 // 找 prev 的后缀和 cur 的前缀的最长匹配长度（以词为单位）。找不到返回 0。
 // 导出出来是为了能单测；主协调者不用管。
+// ---------------------------------------------------------------------------
+// 识别结果清洗：死循环 + 重复识别
+// ---------------------------------------------------------------------------
+//
+// 2026-10-06 第一次拿真实课堂录音（40+19 分钟的艺术史课）测出来的两类问题：
+//
+//   1. 死循环：Whisper 听不清时（课间学生闲聊、远处杂音）会把一句话无限重复，
+//      实测 small 在一处把「I think it's like,」连说了 74 遍，base 把「like, I'm」说了 107 遍、
+//      「Okay.」14 遍。不处理的话这些会原样进讲稿、被翻译、写进概要。
+//   2. 重复识别：整段识别按 30 秒切窗、窗口之间重叠 5 秒，拼接时偶尔没去干净 ——
+//      实测一个 3 秒的片段里塞了将近 30 个词，把前面刚说过的话又说了一遍。
+//
+// 规则（宁可少删）：
+//   · 任何短语（1~12 词）连续出现 ≥3 次 → 只留一次。只出现两次的不动：
+//     「No, no.」是自然重复；「X. X, but Y.」是讲课时很常见的「先说一遍再补充」，
+//     折叠成「X. but Y.」反而把话弄断了（测试用例里专门放了这一句）。
+//   · 一句话（≥5 词）里 ≥70% 的三连词在前面 60 个词里已经出现过 → 是重复识别，丢掉整句
+
+function sameRun (t, a, b, n) {
+  for (let i = 0; i < n; i++) if (t[a + i].n !== t[b + i].n) return false
+  return true
+}
+
+/** 折叠死循环。按词比较（忽略大小写和标点），输出时切原串，标点空格原样保留。 */
+export function collapseLoops (text) {
+  if (!text) return text
+  let t = tokenize(text)
+  if (t.length < 3) return text
+  const cut = []   // [从原串的哪里开始删, 删到哪里]
+  let i = 0
+  while (i < t.length) {
+    let done = false
+    // 从最短的周期找起。反过来从长的找，「I think it's like」×74 会先匹配到「三遍连起来」那个
+    // 12 词的大块，折叠完还剩三遍 —— 还是个循环（真实录音里就是这么漏掉的）。
+    for (let n = 1; n <= Math.min(12, Math.floor((t.length - i) / 3)) && !done; n++) {
+      let reps = 1
+      while (i + (reps + 1) * n <= t.length && sameRun(t, i, i + reps * n, n)) reps++
+      const need = 3
+      if (reps >= need) {
+        const keepEnd = i + n                 // 保留第一遍
+        const dropEnd = i + reps * n          // 后面的全删
+        const from = t[keepEnd] ? t[keepEnd].start : text.length
+        const to = t[dropEnd] ? t[dropEnd].start : text.length
+        cut.push([from, to])
+        i = dropEnd
+        done = true
+      }
+    }
+    if (!done) i++
+  }
+  if (!cut.length) return text
+  let out = '', pos = 0
+  for (const [a, b] of cut) { out += text.slice(pos, a); pos = b }
+  out += text.slice(pos)
+  return out.replace(/\s{2,}/g, ' ').replace(/\s+([,.!?;:])/g, '$1').trim()
+}
+
+const trigrams = toks => {
+  const g = []
+  for (let i = 0; i + 2 < toks.length; i++) g.push(toks[i] + ' ' + toks[i + 1] + ' ' + toks[i + 2])
+  return g
+}
+
+/**
+ * 去掉「把前面刚说过的话又识别了一遍」的句子。
+ * @param {string} text
+ * @param {string[]} recent  前面已经确定的最近若干个词（小写、去标点）。会被就地更新。
+ * @returns {string}
+ */
+export function dropRepeats (text, recent) {
+  if (!text) return text
+  const sentences = text.split(/(?<=[.!?])\s+/)
+  const keep = []
+  for (const sent of sentences) {
+    const toks = tokenize(sent).map(x => x.n)
+    // 跨分段的短句循环：「I don't know.」每个分段里只出现一两次，但一段接一段地重复；
+    // 还有交替的 ——「This is our H.I.S.」「4.3.4.」两句轮流出现（老师让大家做题、教室安静时
+    // Whisper 自己编出来的）。单看每段都不到 3 次、又短于 5 个词，上面两条规则都抓不到。
+    // 规则：和最近 3 句里任何一句一模一样就丢。紧挨着重复同一句话，讲稿里不会少任何信息。
+    const norm = toks.join(' ')
+    if (!recent.sents) recent.sents = []
+    if (norm && recent.sents.includes(norm)) continue
+    if (norm) { recent.sents.push(norm); if (recent.sents.length > 3) recent.sents.shift() }
+    if (toks.length >= 5 && recent.length >= 3) {
+      const seen = new Set(trigrams(recent.slice(-60)))
+      const g = trigrams(toks)
+      const hit = g.filter(x => seen.has(x)).length
+      if (g.length && hit / g.length >= 0.7) continue   // 重复识别，丢掉
+    }
+    keep.push(sent)
+    for (const w of toks) recent.push(w)
+    if (recent.length > 200) recent.splice(0, recent.length - 200)
+  }
+  return keep.join(' ').trim()
+}
+
+/** 整段识别的结果：每个片段先折叠死循环，再跨片段去重复识别；文字按清洗后的片段重新拼。 */
+export function cleanTranscript ({ text, chunks }) {
+  const recent = []
+  if (Array.isArray(chunks) && chunks.length) {
+    const out = []
+    for (const c of chunks) {
+      const x = dropRepeats(collapseLoops(String(c.text || '').trim()), recent)
+      if (x) out.push({ ...c, text: ' ' + x })
+    }
+    return { text: out.map(c => c.text.trim()).join(' '), chunks: out }
+  }
+  return { text: dropRepeats(collapseLoops(String(text || '')), recent), chunks: [] }
+}
+
 export function overlapJoinLength (prev, cur, maxK) {
   const limit = Math.min(maxK, prev.length, cur.length)
   if (limit <= 0) return 0
@@ -781,7 +890,10 @@ export class StreamingWhisper {
     this._prevTokens = curTokens
 
     // 输出原串切片，标点和空格原样保留
-    const text = k >= curTokens.length ? '' : raw.slice(curTokens[k] ? curTokens[k].start : 0).trim()
+    let text = k >= curTokens.length ? '' : raw.slice(curTokens[k] ? curTokens[k].start : 0).trim()
+    // 死循环 + 重复识别（见 cleanTranscript）。_recent 是前面已经交出去的最近若干个词。
+    if (!this._recent) this._recent = []
+    text = dropRepeats(collapseLoops(text), this._recent)
     if (!text) return
 
     // 时间轴：窗口 i 覆盖 [wStart, wStart+window]，去掉的前 k 个词正好对应前 overlapSec，

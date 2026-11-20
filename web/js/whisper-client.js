@@ -94,6 +94,14 @@ export class WhisperWorker {
     return r.text || '';
   }
 
+  // 和 transcribeAll 一样，但连时间戳片段一起返回（导入录音、课后重新识别要用真实时间，不再按句数平均摊）
+  async transcribeWithChunks(pcm, { model, language, ms = 3600000 } = {}) {
+    const buf = pcm.slice().buffer;
+    const r = await this._call({ type: 'transcribe', pcm: buf, model: model || this.opts.model, language: language || this.opts.language, device: this.opts.device },
+      ms, '整段转写', [buf]);
+    return { text: r.text || '', chunks: Array.isArray(r.chunks) ? r.chunks : [] };
+  }
+
   async preload(model, language) {
     return this._call({ type: 'preload', model, language, device: this.opts.device }, 600000, '下载模型');
   }

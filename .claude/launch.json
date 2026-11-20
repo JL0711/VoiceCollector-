@@ -1,6 +1,24 @@
 {
   "version": "0.0.1",
   "configurations": [
-    { "name": "voicecollector", "runtimeExecutable": "python3", "runtimeArgs": ["server.py"], "port": 8787 }
+    {
+      "name": "voicecollector",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "server.py"
+      ],
+      "port": 8787
+    },
+    {
+      "name": "vc-preview",
+      "runtimeExecutable": "env",
+      "runtimeArgs": [
+        "VC_NO_BROWSER=1",
+        "VC_PORT=8791",
+        "node",
+        "server.js"
+      ],
+      "port": 8791
+    }
   ]
 }
